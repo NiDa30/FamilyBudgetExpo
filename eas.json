@@ -1,0 +1,58 @@
+{
+  "cli": {
+    "version": ">= 16.24.1",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleDebug"
+      },
+      "ios": {
+        "buildConfiguration": "Debug",
+        "simulator": true
+      },
+      "cache": {
+        "key": "dev-v1"
+      },
+      "env": {
+        "GRADLE_OPTS": "-Xmx4096m -XX:MaxMetaspaceSize=1024m"
+      }
+    },
+
+    "preview": {
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease"
+      },
+      "distribution": "internal",
+      "cache": {
+        "key": "preview-v1"
+      },
+      "env": {
+        "GRADLE_OPTS": "-Xmx4096m -XX:MaxMetaspaceSize=1024m"
+      }
+    },
+
+    "production": {
+      "autoIncrement": true,
+      "android": {
+        "buildType": "apk"
+      },
+      "cache": {
+        "key": "prod-v1"
+      },
+      "env": {
+        "GRADLE_OPTS": "-Xmx4096m -XX:MaxMetaspaceSize=1024m",
+        "NODE_OPTIONS": "--max-old-space-size=4096"
+      }
+    }
+  },
+
+  "submit": {
+    "production": {}
+  }
+}
