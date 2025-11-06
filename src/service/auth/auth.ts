@@ -65,11 +65,11 @@ export const AuthService = {
       clientId: config.androidClientId || config.iosClientId || config.expoClientId || config.webClientId || "",
       responseType: AuthSession.ResponseType.IdToken,
       scopes: ["openid", "profile", "email"],
-      redirectUri: AuthSession.makeRedirectUri({ useProxy: true }),
+      redirectUri: AuthSession.makeRedirectUri(),
     });
 
     await req.makeAuthUrlAsync(discovery);
-    const result = await req.promptAsync(discovery, { useProxy: true });
+    const result = await req.promptAsync(discovery);
 
     if (result.type !== "success" || !result.params?.id_token) {
       throw new Error("Google login canceled or failed");

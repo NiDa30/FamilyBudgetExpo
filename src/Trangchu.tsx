@@ -1,9 +1,9 @@
 // HomeScreen.js
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import DateTimePicker from "@react-native-community/datetimepicker";
-import { useNavigation } from "@react-navigation/native";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import React, { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   FlatList,
   Modal,
@@ -15,8 +15,12 @@ import {
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { Category, RootStackParamList } from "../App";
+// DÙNG THEME
+import { collection, onSnapshot, query, where } from "firebase/firestore";
+import { useTheme } from "./context/ThemeContext";
+import { CategoryRepository } from "./database/repositories";
+import { auth, db } from "./firebaseConfig";
 import { TransactionService } from "./service/transactions";
-import { auth } from "./firebaseConfig";
 
 type HomeScreenNavigationProp = NativeStackNavigationProp<
   RootStackParamList,
@@ -24,6 +28,10 @@ type HomeScreenNavigationProp = NativeStackNavigationProp<
 >;
 
 const HomeScreen = () => {
+  const navigation = useNavigation<HomeScreenNavigationProp>();
+  // DI CHUYỂN LÊN ĐẦU – TRƯỚC useState
+  const { themeColor } = useTheme();
+
   const [date, setDate] = useState(new Date());
   const [showPicker, setShowPicker] = useState(false);
   const [showCategoryModal, setShowCategoryModal] = useState(false);
@@ -33,7 +41,6 @@ const HomeScreen = () => {
   const [totalBalance, setTotalBalance] = useState(0);
   const [totalExpense, setTotalExpense] = useState(0);
   const [totalIncome, setTotalIncome] = useState(0);
-  const navigation = useNavigation<HomeScreenNavigationProp>();
 
   useEffect(() => {
     loadCategories();
@@ -45,8 +52,387 @@ const HomeScreen = () => {
     refreshTotals();
   }, [date]);
 
+  // ✅ REAL-TIME SYNC: Reload data when screen is focused
+  useFocusEffect(
+    useCallback(() => {
+      const user = auth.currentUser;
+      if (!user?.uid) return;
+
+      console.log("🔄 Trangchu screen focused, reloading data...");
+      loadCategories();
+      refreshTotals();
+
+      // Setup Firebase real-time listeners
+      const start = new Date(
+        date.getFullYear(),
+        date.getMonth(),
+        1
+      ).toISOString();
+      const end = new Date(
+        date.getFullYear(),
+        date.getMonth() + 1,
+        1
+      ).toISOString();
+
+      // Listen to transactions changes
+      const transactionsQuery = query(
+        collection(db, "TRANSACTIONS"),
+        where("userID", "==", user.uid),
+        where("isDeleted", "==", false)
+      );
+
+      const unsubscribeTransactions = onSnapshot(
+        transactionsQuery,
+        async (snapshot) => {
+          console.log(
+            `📊 Firebase transactions updated: ${snapshot.docs.length} transactions`
+          );
+
+          // Sync Firebase transactions to SQLite
+          try {
+            const TransactionRepository = (
+              await import("./database/repositories")
+            ).TransactionRepository;
+
+            for (const doc of snapshot.docs) {
+              const data = doc.data();
+              try {
+                // Check if transaction exists in SQLite
+                const existing = await TransactionRepository.getById(doc.id);
+
+                if (!existing) {
+                  // Save new transaction to SQLite
+                  await TransactionRepository.create({
+                    id: doc.id,
+                    userId: data.userID || user.uid,
+                    categoryId: data.categoryID || null,
+                    amount: data.amount || 0,
+                    type: data.type || "EXPENSE",
+                    date: data.date?.toMillis
+                      ? new Date(data.date.toMillis()).toISOString()
+                      : data.date || new Date().toISOString(),
+                    description: data.description || null,
+                    paymentMethod: data.paymentMethod || null,
+                    merchantName: data.merchantName || null,
+                    merchantLocation: data.merchantLocation || null,
+                    latitude: data.latitude || null,
+                    longitude: data.longitude || null,
+                    tags: data.tags ? data.tags.split(",") : undefined,
+                    isSynced: true,
+                    lastModifiedAt: data.updatedAt?.toMillis
+                      ? new Date(data.updatedAt.toMillis()).toISOString()
+                      : new Date().toISOString(),
+                    isDeleted: false,
+                    createdAt: data.createdAt?.toMillis
+                      ? new Date(data.createdAt.toMillis()).toISOString()
+                      : new Date().toISOString(),
+                  });
+                  console.log(`✅ Synced transaction ${doc.id} to SQLite`);
+                }
+              } catch (syncError) {
+                console.warn(
+                  `Failed to sync transaction ${doc.id}:`,
+                  syncError
+                );
+              }
+            }
+          } catch (syncError) {
+            console.warn("Failed to sync transactions to SQLite:", syncError);
+          }
+
+          // Refresh totals when transactions change
+          await refreshTotals();
+        },
+        (error) => {
+          console.error("Firebase transactions listener error:", error);
+        }
+      );
+
+      // Listen to categories changes
+      const categoriesQuery = query(
+        collection(db, "CATEGORIES"),
+        where("userID", "==", user.uid),
+        where("isHidden", "==", false)
+      );
+
+      const unsubscribeCategories = onSnapshot(
+        categoriesQuery,
+        async (snapshot) => {
+          console.log(
+            `📋 Firebase categories updated: ${snapshot.docs.length} categories`
+          );
+
+          // Sync Firebase categories to SQLite
+          try {
+            const databaseServiceModule = await import(
+              "./database/databaseService"
+            );
+            const databaseService =
+              databaseServiceModule.default ||
+              databaseServiceModule.DatabaseService;
+
+            const CategoryRepository = (await import("./database/repositories"))
+              .CategoryRepository;
+            let currentSQLiteCategories = await CategoryRepository.listByUser(
+              user.uid
+            );
+
+            for (const doc of snapshot.docs) {
+              const data = doc.data();
+              try {
+                // Check if category exists in SQLite (check both current list and already synced in this batch)
+                const exists = currentSQLiteCategories.some(
+                  (c) => c.id === doc.id
+                );
+
+                if (!exists) {
+                  // Save new category to SQLite using INSERT OR REPLACE to avoid UNIQUE constraint errors
+                  try {
+                    await databaseService.createCategory({
+                      id: doc.id,
+                      user_id: data.userID || user.uid,
+                      name: data.name,
+                      type: data.type || "EXPENSE",
+                      icon: data.icon || "tag",
+                      color: data.color || "#2196F3",
+                      is_system_default: data.isSystemDefault ? 1 : 0,
+                      display_order: data.displayOrder || 0,
+                      is_hidden: data.isHidden ? 1 : 0,
+                    });
+                    await databaseService.markAsSynced("categories", doc.id);
+
+                    // ✅ UPDATE STATE: Add to currentSQLiteCategories to prevent duplicate syncs
+                    currentSQLiteCategories.push({
+                      id: doc.id,
+                      name: data.name,
+                      type: data.type || "EXPENSE",
+                      icon: data.icon || "tag",
+                      color: data.color || "#2196F3",
+                    } as any);
+
+                    console.log(`✅ Synced category ${data.name} to SQLite`);
+                  } catch (createError: any) {
+                    // If UNIQUE constraint error, try to update instead
+                    if (createError?.message?.includes("UNIQUE constraint")) {
+                      try {
+                        await databaseService.updateCategory(doc.id, {
+                          name: data.name,
+                          type: data.type || "EXPENSE",
+                          icon: data.icon || "tag",
+                          color: data.color || "#2196F3",
+                          is_system_default: data.isSystemDefault ? 1 : 0,
+                          display_order: data.displayOrder || 0,
+                          is_hidden: data.isHidden ? 1 : 0,
+                        });
+                        await databaseService.markAsSynced(
+                          "categories",
+                          doc.id
+                        );
+
+                        // ✅ UPDATE STATE: Add to currentSQLiteCategories to prevent duplicate syncs
+                        const alreadyExists = currentSQLiteCategories.some(
+                          (c) => c.id === doc.id
+                        );
+                        if (!alreadyExists) {
+                          currentSQLiteCategories.push({
+                            id: doc.id,
+                            name: data.name,
+                            type: data.type || "EXPENSE",
+                            icon: data.icon || "tag",
+                            color: data.color || "#2196F3",
+                          } as any);
+                        }
+
+                        console.log(
+                          `✅ Updated category ${data.name} in SQLite`
+                        );
+                      } catch (updateError) {
+                        // Suppress duplicate error logs
+                      }
+                    }
+                  }
+                }
+              } catch (syncError) {
+                // Suppress duplicate error logs for UNIQUE constraint errors
+                const errorMessage =
+                  syncError instanceof Error
+                    ? syncError.message
+                    : String(syncError);
+                if (!errorMessage.includes("UNIQUE constraint")) {
+                  console.warn(`Failed to sync category ${doc.id}:`, syncError);
+                }
+              }
+            }
+          } catch (syncError) {
+            console.warn("Failed to sync categories to SQLite:", syncError);
+          }
+
+          // Reload categories when they change
+          await loadCategories();
+        },
+        (error) => {
+          console.error("Firebase categories listener error:", error);
+        }
+      );
+
+      return () => {
+        unsubscribeTransactions();
+        unsubscribeCategories();
+      };
+    }, [date])
+  );
+
   const loadCategories = async () => {
     try {
+      const user = auth.currentUser;
+      if (!user?.uid) return;
+
+      // ✅ ENSURE CATEGORIES ARE INITIALIZED
+      try {
+        const databaseServiceModule = await import(
+          "./database/databaseService"
+        );
+        const { ensureCategoriesInitialized } = databaseServiceModule;
+
+        if (
+          ensureCategoriesInitialized &&
+          typeof ensureCategoriesInitialized === "function"
+        ) {
+          await ensureCategoriesInitialized(user.uid);
+        } else {
+          console.warn(
+            "ensureCategoriesInitialized is not available, trying alternative import"
+          );
+          const databaseService =
+            databaseServiceModule.default ||
+            databaseServiceModule.DatabaseService;
+          if (
+            databaseService &&
+            typeof databaseService.ensureInitialized === "function"
+          ) {
+            await databaseService.ensureInitialized();
+          }
+        }
+      } catch (initError) {
+        console.warn("Failed to ensure categories initialized:", initError);
+      }
+
+      // ✅ LOAD FROM SQLITE OR FIREBASE (FALLBACK)
+      try {
+        const sqliteCategories = await CategoryRepository.listByUser(user.uid);
+
+        if (sqliteCategories && sqliteCategories.length > 0) {
+          // Filter by type
+          const expense = sqliteCategories
+            .filter((cat) => (cat.type || "EXPENSE") === "EXPENSE")
+            .map((cat) => ({
+              id: cat.id,
+              name: cat.name,
+              icon: cat.icon || "tag",
+              color: cat.color || "#2196F3",
+              count: 0, // Add count property for Category type compatibility
+            }));
+          const income = sqliteCategories
+            .filter((cat) => (cat.type || "INCOME") === "INCOME")
+            .map((cat) => ({
+              id: cat.id,
+              name: cat.name,
+              icon: cat.icon || "tag",
+              color: cat.color || "#2196F3",
+              count: 0, // Add count property for Category type compatibility
+            }));
+
+          setExpenseCategories(expense);
+          setIncomeCategories(income);
+
+          // Save to AsyncStorage for quick access
+          await AsyncStorage.setItem(
+            "expenseCategories",
+            JSON.stringify(expense)
+          );
+          await AsyncStorage.setItem(
+            "incomeCategories",
+            JSON.stringify(income)
+          );
+
+          console.log(
+            `✅ Loaded ${expense.length} expense & ${income.length} income categories from SQLite`
+          );
+          return;
+        }
+      } catch (sqliteError) {
+        console.warn("Failed to load from SQLite:", sqliteError);
+      }
+
+      // ✅ FALLBACK TO FIREBASE
+      try {
+        const FirebaseService = (
+          await import("./service/firebase/FirebaseService")
+        ).default;
+        const firebaseCategories = await FirebaseService.getCategories(
+          user.uid
+        );
+
+        if (firebaseCategories && firebaseCategories.length > 0) {
+          const mappedCategories: any[] = firebaseCategories.map(
+            (cat: any) => ({
+              id: cat.id || cat.categoryID,
+              userId: cat.userID || user.uid,
+              name: cat.name,
+              type: cat.type || "EXPENSE",
+              icon: cat.icon,
+              color: cat.color,
+              isSystemDefault: cat.isSystemDefault || false,
+              displayOrder: cat.displayOrder || 0,
+              isHidden: cat.isHidden || false,
+              createdAt: cat.createdAt
+                ? new Date(cat.createdAt).toISOString()
+                : new Date().toISOString(),
+            })
+          );
+
+          const expense = mappedCategories
+            .filter((cat: any) => cat.type === "EXPENSE")
+            .map((cat: any) => ({
+              id: cat.id,
+              name: cat.name,
+              icon: cat.icon || "tag",
+              color: cat.color || "#2196F3",
+              count: 0, // Add count property for Category type compatibility
+            }));
+          const income = mappedCategories
+            .filter((cat: any) => cat.type === "INCOME")
+            .map((cat: any) => ({
+              id: cat.id,
+              name: cat.name,
+              icon: cat.icon || "tag",
+              color: cat.color || "#2196F3",
+              count: 0, // Add count property for Category type compatibility
+            }));
+
+          setExpenseCategories(expense);
+          setIncomeCategories(income);
+
+          // Save to AsyncStorage
+          await AsyncStorage.setItem(
+            "expenseCategories",
+            JSON.stringify(expense)
+          );
+          await AsyncStorage.setItem(
+            "incomeCategories",
+            JSON.stringify(income)
+          );
+
+          console.log(
+            `✅ Loaded ${expense.length} expense & ${income.length} income categories from Firebase`
+          );
+          return;
+        }
+      } catch (firebaseError) {
+        console.warn("Failed to load from Firebase:", firebaseError);
+      }
+
+      // ✅ FALLBACK TO ASYNCSTORAGE
       const storedExpense = await AsyncStorage.getItem("expenseCategories");
       const storedIncome = await AsyncStorage.getItem("incomeCategories");
 
@@ -77,16 +463,70 @@ const HomeScreen = () => {
         1
       ).toISOString();
 
-      const [expenses, incomes] = await Promise.all([
-        TransactionService.query(user.uid, {
-          range: { start, end },
-          type: "EXPENSE",
-        }),
-        TransactionService.query(user.uid, {
-          range: { start, end },
-          type: "INCOME",
-        }),
-      ]);
+      // ✅ LOAD FROM SQLITE FIRST (FAST)
+      let expenses: any[] = [];
+      let incomes: any[] = [];
+
+      try {
+        const [sqliteExpenses, sqliteIncomes] = await Promise.all([
+          TransactionService.query(user.uid, {
+            range: { start, end },
+            type: "EXPENSE",
+          }),
+          TransactionService.query(user.uid, {
+            range: { start, end },
+            type: "INCOME",
+          }),
+        ]);
+
+        expenses = sqliteExpenses || [];
+        incomes = sqliteIncomes || [];
+
+        console.log(
+          `📊 Loaded ${expenses.length} expenses & ${incomes.length} incomes from SQLite`
+        );
+      } catch (sqliteError) {
+        console.warn("Failed to load from SQLite:", sqliteError);
+      }
+
+      // ✅ FALLBACK TO FIREBASE IF SQLITE IS EMPTY
+      if (
+        (expenses.length === 0 && incomes.length === 0) ||
+        expenses.length === 0 ||
+        incomes.length === 0
+      ) {
+        try {
+          const FirebaseService = (
+            await import("./service/firebase/FirebaseService")
+          ).default;
+          const firebaseTransactions = await FirebaseService.getTransactions(
+            user.uid,
+            {
+              startDate: new Date(start).getTime(),
+              endDate: new Date(end).getTime(),
+            }
+          );
+
+          if (firebaseTransactions && firebaseTransactions.length > 0) {
+            const firebaseExpenses = firebaseTransactions.filter(
+              (t: any) => t.type === "EXPENSE"
+            );
+            const firebaseIncomes = firebaseTransactions.filter(
+              (t: any) => t.type === "INCOME"
+            );
+
+            // Use Firebase data if SQLite is empty
+            if (expenses.length === 0) expenses = firebaseExpenses;
+            if (incomes.length === 0) incomes = firebaseIncomes;
+
+            console.log(
+              `📊 Loaded ${firebaseExpenses.length} expenses & ${firebaseIncomes.length} incomes from Firebase`
+            );
+          }
+        } catch (firebaseError) {
+          console.warn("Failed to load from Firebase:", firebaseError);
+        }
+      }
 
       const expense = expenses.reduce((s, t) => s + (t.amount || 0), 0);
       const income = incomes.reduce((s, t) => s + (t.amount || 0), 0);
@@ -94,6 +534,12 @@ const HomeScreen = () => {
       setTotalExpense(expense);
       setTotalIncome(income);
       setTotalBalance(income - expense);
+
+      console.log(
+        `💰 Updated totals: Expense=${expense}, Income=${income}, Balance=${
+          income - expense
+        }`
+      );
     } catch (error) {
       console.error("Error calculating totals:", error);
     }
@@ -123,8 +569,6 @@ const HomeScreen = () => {
   };
 
   const getBudgetStatus = () => {
-    if (totalBalance > 0) return "Thặng dư";
-    if (totalBalance < 0) return "Thâm hụt";
     return "Số dư";
   };
 
@@ -160,8 +604,8 @@ const HomeScreen = () => {
 
   return (
     <View style={styles.container}>
-      {/* Header màu xanh với gradient effect */}
-      <View style={styles.blueHeader}>
+      {/* Header – DÙNG MÀU THEME */}
+      <View style={[styles.blueHeader, { backgroundColor: themeColor }]}>
         {/* Status bar */}
         <View style={styles.statusBar}>
           <Text style={styles.statusTime}>{formatTime()}</Text>
@@ -173,9 +617,9 @@ const HomeScreen = () => {
               color="#fff"
               style={{ marginLeft: 6 }}
             />
-            <Text style={styles.statusBattery}>100%</Text>
+            <Text style={styles.statusBattery}>59%</Text>
             <Icon
-              name="battery"
+              name="battery-70"
               size={18}
               color="#fff"
               style={{ marginLeft: 2 }}
@@ -401,30 +845,35 @@ const HomeScreen = () => {
           <Text style={styles.navLabel}>Quét hóa đơn</Text>
         </TouchableOpacity>
 
-        {/* FAB button */}
+        {/* FAB button – DÙNG MÀU THEME */}
         <TouchableOpacity
-          style={styles.addButton}
-          activeOpacity={0.8}
+          style={[
+            styles.addButton,
+            { backgroundColor: themeColor, shadowColor: themeColor },
+          ]}
           onPress={() => setShowCategoryModal(true)}
+          activeOpacity={0.9}
         >
           <Icon name="plus" size={28} color="#fff" />
         </TouchableOpacity>
       </View>
 
-      {/* Category Modal */}
+      {/* Category Selection Modal */}
       <Modal
         visible={showCategoryModal}
         transparent={true}
         animationType="slide"
         onRequestClose={() => setShowCategoryModal(false)}
       >
-        <View style={styles.modalOverlay}>
-          <TouchableOpacity
-            style={{ flex: 1 }}
-            activeOpacity={1}
-            onPress={() => setShowCategoryModal(false)}
-          />
-          <View style={styles.modalContent}>
+        <TouchableOpacity
+          style={styles.modalOverlay}
+          activeOpacity={1}
+          onPress={() => setShowCategoryModal(false)}
+        >
+          <View
+            style={styles.modalContent}
+            onStartShouldSetResponder={() => true}
+          >
             <View style={styles.modalHandle} />
 
             <View style={styles.modalHeader}>
@@ -445,8 +894,8 @@ const HomeScreen = () => {
                     ]}
                   >
                     <Icon
-                      name="arrow-up"
-                      size={16}
+                      name="arrow-up-circle"
+                      size={24}
                       color={activeTab === "expense" ? "#fff" : "#F44336"}
                     />
                   </View>
@@ -479,8 +928,8 @@ const HomeScreen = () => {
                     ]}
                   >
                     <Icon
-                      name="arrow-down"
-                      size={16}
+                      name="arrow-down-circle"
+                      size={24}
                       color={activeTab === "income" ? "#fff" : "#4CAF50"}
                     />
                   </View>
@@ -496,47 +945,24 @@ const HomeScreen = () => {
               </View>
 
               <TouchableOpacity
+                onPress={() => navigation.navigate("Home")}
                 style={styles.modalSettingsButton}
                 activeOpacity={0.7}
-                onPress={() => {
-                  setShowCategoryModal(false);
-                  navigation.navigate("Nhappl");
-                }}
               >
-                <Icon name="cog-outline" size={22} color="#757575" />
+                <Icon name="cog-outline" size={24} color="#757575" />
               </TouchableOpacity>
             </View>
 
-            {currentCategories.length > 0 ? (
-              <FlatList
-                data={currentCategories}
-                renderItem={renderCategoryItem}
-                keyExtractor={(item) => item.id}
-                style={styles.categoryList}
-                showsVerticalScrollIndicator={false}
-              />
-            ) : (
-              <View style={styles.emptyCategoryContainer}>
-                <Icon name="folder-open-outline" size={64} color="#E0E0E0" />
-                <Text style={styles.emptyCategoryText}>
-                  Chưa có danh mục nào
-                </Text>
-                <TouchableOpacity
-                  style={styles.addCategoryButton}
-                  onPress={() => {
-                    setShowCategoryModal(false);
-                    navigation.navigate("Nhappl");
-                  }}
-                  activeOpacity={0.8}
-                >
-                  <Text style={styles.addCategoryButtonText}>
-                    Thêm danh mục
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            )}
+            <FlatList
+              data={currentCategories}
+              renderItem={renderCategoryItem}
+              keyExtractor={(item) => item.id}
+              numColumns={1}
+              contentContainerStyle={styles.categoryList}
+              showsVerticalScrollIndicator={false}
+            />
           </View>
-        </View>
+        </TouchableOpacity>
       </Modal>
     </View>
   );
@@ -545,31 +971,29 @@ const HomeScreen = () => {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#F8F9FA",
+    backgroundColor: "#FAFAFA",
   },
   blueHeader: {
-    backgroundColor: "#1E88E5",
-    paddingTop: 8,
-    paddingBottom: 24,
-    borderBottomLeftRadius: 24,
-    borderBottomRightRadius: 24,
-    shadowColor: "#1E88E5",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.2,
-    shadowRadius: 12,
-    elevation: 8,
+    // ĐÃ XÓA backgroundColor: '#1E88E5'
+    paddingTop: 10,
+    paddingBottom: 20,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 5,
   },
   statusBar: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
     paddingHorizontal: 20,
-    paddingVertical: 8,
+    paddingVertical: 6,
   },
   statusTime: {
     color: "#fff",
-    fontSize: 13,
-    fontWeight: "500",
+    fontSize: 14,
+    fontWeight: "600",
   },
   statusIcons: {
     flexDirection: "row",
@@ -577,15 +1001,16 @@ const styles = StyleSheet.create({
   },
   statusBattery: {
     color: "#fff",
-    fontSize: 12,
+    fontSize: 13,
     marginLeft: 6,
+    fontWeight: "500",
   },
   dateHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
     paddingHorizontal: 20,
-    paddingVertical: 12,
+    marginTop: 16,
   },
   dateLeft: {
     flexDirection: "row",
@@ -598,19 +1023,19 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(255, 255, 255, 0.2)",
     justifyContent: "center",
     alignItems: "center",
-    marginRight: 10,
   },
   dateText: {
     color: "#fff",
     fontSize: 16,
     fontWeight: "600",
-    marginRight: 10,
+    marginLeft: 12,
   },
   statusBadge: {
     backgroundColor: "rgba(255, 255, 255, 0.25)",
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
     paddingVertical: 4,
     borderRadius: 12,
+    marginLeft: 8,
   },
   statusBadgeText: {
     color: "#fff",
@@ -626,76 +1051,78 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   budgetContainer: {
-    alignItems: "center",
-    paddingVertical: 16,
+    paddingHorizontal: 20,
+    marginTop: 24,
   },
   budgetLabel: {
-    color: "rgba(255, 255, 255, 0.85)",
+    color: "rgba(255, 255, 255, 0.9)",
     fontSize: 14,
-    marginBottom: 8,
+    marginBottom: 4,
+    fontWeight: "500",
   },
   budgetAmountWrapper: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "baseline",
   },
   currencySymbol: {
     color: "#fff",
-    fontSize: 24,
-    fontWeight: "600",
+    fontSize: 32,
+    fontWeight: "400",
     marginRight: 4,
   },
   budgetAmount: {
     color: "#fff",
-    fontSize: 36,
-    fontWeight: "700",
+    fontSize: 56,
+    fontWeight: "300",
+    letterSpacing: -1,
   },
   summaryContainer: {
     flexDirection: "row",
     paddingHorizontal: 20,
-    marginTop: 12,
+    marginTop: 20,
   },
   summaryCard: {
     flex: 1,
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "rgba(255, 255, 255, 0.15)",
+    backgroundColor: "rgba(255, 255, 255, 0.2)",
     borderRadius: 16,
-    padding: 14,
-    backdropFilter: "blur(10px)",
+    padding: 12,
   },
   summaryIconWrapper: {
     width: 40,
     height: 40,
     borderRadius: 20,
-    backgroundColor: "rgba(255, 82, 82, 0.15)",
+    backgroundColor: "rgba(244, 67, 54, 0.15)",
     justifyContent: "center",
     alignItems: "center",
-    marginRight: 12,
   },
   summaryInfo: {
+    marginLeft: 12,
     flex: 1,
   },
   summaryLabel: {
-    color: "rgba(255, 255, 255, 0.85)",
+    color: "rgba(255, 255, 255, 0.9)",
     fontSize: 12,
-    marginBottom: 4,
+    marginBottom: 2,
   },
   summaryAmount: {
     color: "#fff",
     fontSize: 16,
-    fontWeight: "700",
+    fontWeight: "600",
   },
   whiteSection: {
     backgroundColor: "#fff",
-    marginHorizontal: 20,
-    marginTop: -16,
-    borderRadius: 16,
-    padding: 16,
+    paddingHorizontal: 20,
+    paddingVertical: 20,
+    marginTop: -10,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
     shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.08,
+    shadowOffset: { width: 0, height: -2 },
+    shadowOpacity: 0.05,
     shadowRadius: 8,
-    elevation: 4,
+    elevation: 3,
   },
   budgetSettingHeader: {
     flexDirection: "row",
@@ -704,33 +1131,34 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   budgetSettingTitle: {
-    fontSize: 15,
-    fontWeight: "600",
+    fontSize: 16,
     color: "#212121",
+    fontWeight: "600",
   },
   budgetSettingLink: {
-    fontSize: 13,
+    fontSize: 14,
     color: "#1E88E5",
-    fontWeight: "600",
+    fontWeight: "500",
   },
   budgetBar: {
-    height: 8,
+    height: 10,
     backgroundColor: "#E3F2FD",
-    borderRadius: 4,
+    borderRadius: 5,
     overflow: "hidden",
-    marginBottom: 8,
   },
   budgetBarFill: {
     height: "100%",
-    backgroundColor: "#FF5252",
-    borderRadius: 4,
+    width: "0%",
+    backgroundColor: "#42A5F5",
   },
   budgetBarText: {
     fontSize: 12,
-    color: "#757575",
+    color: "#9E9E9E",
+    marginTop: 8,
   },
   emptyContainer: {
     flex: 1,
+    backgroundColor: "#FAFAFA",
   },
   emptyContent: {
     flexGrow: 1,
@@ -739,16 +1167,16 @@ const styles = StyleSheet.create({
     paddingVertical: 40,
   },
   emptyIllustration: {
-    width: 200,
-    height: 200,
+    width: 240,
+    height: 240,
     justifyContent: "center",
     alignItems: "center",
-    marginBottom: 24,
     position: "relative",
+    marginBottom: 24,
   },
   decorIcon1: {
     position: "absolute",
-    top: 20,
+    top: 10,
     left: 20,
     opacity: 0.6,
   },
@@ -864,13 +1292,12 @@ const styles = StyleSheet.create({
     fontWeight: "500",
   },
   addButton: {
+    // ĐÃ XÓA backgroundColor: '#1E88E5'
     width: 56,
     height: 56,
     borderRadius: 28,
-    backgroundColor: "#1E88E5",
     justifyContent: "center",
     alignItems: "center",
-    shadowColor: "#1E88E5",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.3,
     shadowRadius: 8,

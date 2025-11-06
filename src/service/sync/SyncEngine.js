@@ -1,6 +1,8 @@
-import NetInfo from "@react-native-community/netinfo";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import DatabaseService from "../../database/databaseService";
+import NetInfo from "@react-native-community/netinfo";
+import DatabaseService, {
+  addDefaultCategories,
+} from "../../database/databaseService";
 import FirebaseService from "../firebase/FirebaseService";
 
 class SyncEngine {
@@ -31,7 +33,7 @@ class SyncEngine {
 
       if (firebaseCategories.length === 0) {
         console.log("👤 New user - creating default categories...");
-        await DatabaseService.addDefaultCategories(userId);
+        await addDefaultCategories(userId);
         await this.pushLocalChanges(userId);
       } else {
         console.log("📥 Existing user - pulling data from Firebase...");
@@ -204,14 +206,14 @@ class SyncEngine {
             } else {
               await FirebaseService.addTransaction(userId, {
                 ...transaction,
-                updatedAt: transaction.updated_at || Date.now(),
+                updatedAt: transaction.last_modified_at || Date.now(),
               });
             }
 
             await DatabaseService.markAsSynced("transactions", transaction.id);
             pushedCount++;
           } catch (error) {
-            console.error(`❌ Failed transaction push`, error);
+            console.error("❌ Failed transaction push", error);
           }
         }
       }
@@ -312,7 +314,8 @@ class SyncEngine {
             date: remote.date,
             payment_method: remote.paymentMethod,
             merchant_name: remote.merchantName,
-            updated_at: remote.updatedAt || remote.createdAt || Date.now(),
+            last_modified_at:
+              remote.updatedAt || remote.createdAt || Date.now(),
           });
 
           await DatabaseService.markAsSynced(
@@ -322,7 +325,7 @@ class SyncEngine {
           pulledCount++;
         } else {
           const remoteTime = remote.updatedAt || remote.createdAt || 0;
-          const localTime = localTransaction.updated_at || 0;
+          const localTime = localTransaction.last_modified_at || 0;
 
           if (remoteTime > localTime) {
             const hasChanges =
@@ -336,7 +339,7 @@ class SyncEngine {
                   category_id: remote.categoryID,
                   amount: remote.amount,
                   description: remote.description,
-                  updated_at: remoteTime,
+                  last_modified_at: remoteTime,
                 }
               );
             }
@@ -350,43 +353,34 @@ class SyncEngine {
       }
 
       if (pulledCount > 0) {
-        console.log(`📥 Pulled ${pulledCount} new items from remote`);
+        console.log(`📥 Pull completed: ${pulledCount} items`);
       } else {
-        console.log("✓ Already up to date");
+        console.log("✓ No remote changes");
       }
+
+      return { pulledCount };
     } catch (error) {
       console.error("❌ Pull failed:", error);
       throw error;
     }
   }
 
-  // ==================== MANUAL SYNC ====================
+  // ==================== FULL SYNC ====================
 
-  async forceSyncNow(userId) {
-    console.log("🔄 Manual sync triggered");
-    return await this.performSync(userId, true); // force = true
-  }
-
-  async getSyncStatus() {
-    let pendingCount = 0;
-
+  async syncAll(userId) {
+    console.log("🔄 Starting full sync...");
     try {
-      const pendingCategories = await DatabaseService.getUnsyncedRecords(
-        "categories"
-      );
-      const pendingTransactions = await DatabaseService.getUnsyncedRecords(
-        "transactions"
-      );
-      pendingCount = pendingCategories.length + pendingTransactions.length;
-    } catch (error) {
-      console.error("Error getting sync status:", error);
-    }
+      const pushResult = await this.pushLocalChanges(userId);
+      const pullResult = await this.pullRemoteChanges(userId);
 
-    return {
-      isSyncing: this.isSyncing,
-      lastSyncTime: this.lastSyncTime,
-      pendingCount: pendingCount,
-    };
+      console.log(
+        `✅ Sync completed: ${pushResult.pushedCount} pushed, ${pullResult.pulledCount} pulled`
+      );
+      return { ...pushResult, ...pullResult };
+    } catch (error) {
+      console.error("❌ Sync failed:", error);
+      throw error;
+    }
   }
 }
 

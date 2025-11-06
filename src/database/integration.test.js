@@ -1,138 +1,93 @@
-import DatabaseService from "./database";
-import {
-  UserService,
-  CategoryService,
-  TransactionService,
-} from "./databaseService";
+// src/database/migrations.js
 
-// Integration test for the database implementation
-export const runIntegrationTest = async () => {
-  console.log("Running database integration test...");
+export const runMigrations = async (db) => {
+  console.log("Running database migrations...");
 
   try {
-    // Test 1: Database initialization
-    console.log("Test 1: Database initialization");
-    const db = DatabaseService.getDB();
-    if (db) {
-      console.log("✓ Database initialized successfully");
-    } else {
-      throw new Error("Database failed to initialize");
-    }
-
-    // Test 2: Create and retrieve user
-    console.log("Test 2: User operations");
-    const userId = "int-test-user-" + Date.now();
-    const userEmail = `integration-test-${Date.now()}@example.com`;
-
-    const testUser = {
-      id: userId,
-      email: userEmail,
-      password_hash: "test-password-hash",
-      name: "Integration Test User",
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-
-    // Create user
-    UserService.createUser(testUser);
-    console.log("✓ User created successfully");
-
-    // Retrieve user
-    const retrievedUser = UserService.getUserById(userId);
-    if (retrievedUser && retrievedUser.email === userEmail) {
-      console.log("✓ User retrieved successfully");
-    } else {
-      throw new Error("Failed to retrieve user");
-    }
-
-    // Test 3: Create and retrieve category
-    console.log("Test 3: Category operations");
-    const categoryId = "int-test-cat-" + Date.now();
-
-    const testCategory = {
-      id: categoryId,
-      user_id: userId,
-      name: "Integration Test Category",
-      type: "EXPENSE",
-      is_system_default: false,
-      icon: "test-icon",
-      color: "#00FF00",
-      created_at: new Date().toISOString(),
-    };
-
-    // Create category
-    CategoryService.createCategory(testCategory);
-    console.log("✓ Category created successfully");
-
-    // Retrieve categories
-    const categories = CategoryService.getCategoriesByUser(userId);
-    if (categories.length > 0) {
-      console.log("✓ Categories retrieved successfully");
-    } else {
-      throw new Error("Failed to retrieve categories");
-    }
-
-    // Test 4: Create and retrieve transaction
-    console.log("Test 4: Transaction operations");
-    const transactionId = "int-test-txn-" + Date.now();
-
-    const testTransaction = {
-      id: transactionId,
-      user_id: userId,
-      category_id: categoryId,
-      amount: 250000,
-      type: "EXPENSE",
-      date: new Date().toISOString(),
-      description: "Integration test transaction",
-      created_at: new Date().toISOString(),
-    };
-
-    // Create transaction
-    TransactionService.createTransaction(testTransaction);
-    console.log("✓ Transaction created successfully");
-
-    // Retrieve transactions
-    const transactions = TransactionService.getTransactionsByUser(userId);
-    if (transactions.length > 0) {
-      console.log("✓ Transactions retrieved successfully");
-    } else {
-      throw new Error("Failed to retrieve transactions");
-    }
-
-    // Test 5: Test queries with results
-    console.log("Test 5: Query operations");
-    const transactionSummary = TransactionService.getTransactionSummary(
-      userId,
-      new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days ago
-      new Date().toISOString()
-    );
-    console.log(
-      `✓ Transaction summary retrieved: ${transactionSummary.length} records`
-    );
-
-    // Clean up test data
-    console.log("Cleaning up test data...");
-    // Note: In a real test, we would clean up, but for now we'll leave the data
-
-    console.log("All integration tests passed!");
-    return true;
+    await addMissingTransactionColumns(db);
+    console.log("All migrations completed successfully!");
   } catch (error) {
-    console.error("Integration test failed:", error);
-    return false;
+    console.error("Error running migrations:", error);
   }
 };
 
-// Run the integration test if this file is executed directly
-if (require.main === module) {
-  runIntegrationTest().then((success) => {
-    if (success) {
-      console.log("Integration test completed successfully!");
-      process.exit(0);
-    } else {
-      console.log("Integration test failed!");
-      process.exit(1);
-    }
-  });
-}
+export const addMissingTransactionColumns = async (db) => {
+  console.log("Checking for missing transaction columns...");
 
-export default { runIntegrationTest };
+  if (!db) {
+    throw new Error("Database instance not available");
+  }
+
+  try {
+    // Thêm updated_at nếu chưa có (để tương thích DB cũ)
+    try {
+      await db.execAsync("ALTER TABLE transactions ADD COLUMN updated_at TEXT");
+      console.log("Added updated_at column to transactions table");
+    } catch (error) {
+      if (!error.message.includes("duplicate column name")) {
+        console.warn("Warning adding updated_at:", error.message);
+      }
+    }
+
+    // Đồng bộ dữ liệu: copy updated_at từ last_modified_at nếu cần
+    await db.execAsync(`
+      UPDATE transactions 
+      SET updated_at = last_modified_at 
+      WHERE updated_at IS NULL AND last_modified_at IS NOT NULL
+    `);
+
+    await db.execAsync(`
+      UPDATE transactions 
+      SET updated_at = created_at 
+      WHERE updated_at IS NULL AND created_at IS NOT NULL
+    `);
+
+    // Các cột khác
+    const columnsToAdd = [
+      {
+        name: "location_lat",
+        sql: "ALTER TABLE transactions ADD COLUMN location_lat REAL",
+      },
+      {
+        name: "location_lng",
+        sql: "ALTER TABLE transactions ADD COLUMN location_lng REAL",
+      },
+      {
+        name: "merchant_location",
+        sql: "ALTER TABLE transactions ADD COLUMN merchant_location TEXT",
+      },
+      {
+        name: "last_modified_at",
+        sql: "ALTER TABLE transactions ADD COLUMN last_modified_at TEXT",
+      },
+    ];
+
+    for (const col of columnsToAdd) {
+      try {
+        await db.execAsync(col.sql);
+        console.log(`Added ${col.name} column`);
+      } catch (error) {
+        if (!error.message.includes("duplicate column name")) {
+          console.warn(`Warning adding ${col.name}:`, error.message);
+        }
+      }
+    }
+
+    // Tạo index
+    try {
+      await db.execAsync(
+        "CREATE INDEX IF NOT EXISTS idx_transactions_last_modified ON transactions(last_modified_at)"
+      );
+      console.log("Created index on last_modified_at");
+    } catch (error) {
+      console.warn("Warning creating index:", error.message);
+    }
+
+    console.log("Transaction table schema check completed");
+  } catch (error) {
+    console.error("Error adding missing transaction columns:", error);
+    throw error;
+  }
+};
+
+export default { runMigrations, addMissingTransactionColumns };

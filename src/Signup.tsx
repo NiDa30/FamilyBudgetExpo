@@ -1,6 +1,8 @@
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
+import * as Google from "expo-auth-session/providers/google";
+import * as WebBrowser from "expo-web-browser";
 import { createUserWithEmailAndPassword, updateProfile } from "firebase/auth";
-import React, { useState, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -15,7 +17,11 @@ import {
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { RootStackParamList } from "../App";
+import Captcha from "./components/Captcha";
 import { authInstance as auth } from "./firebaseConfig";
+import { AuthService } from "./service/auth/auth";
+
+WebBrowser.maybeCompleteAuthSession();
 
 type SignUpScreenNavigationProp = NativeStackNavigationProp<
   RootStackParamList,
@@ -35,12 +41,49 @@ const SignUpScreen: React.FC<Props> = ({ navigation }) => {
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [agreeTerms, setAgreeTerms] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [captchaValue, setCaptchaValue] = useState("");
+  const [isCaptchaValid, setIsCaptchaValid] = useState(false);
+
+  const [request, response, promptAsync] = Google.useAuthRequest({
+    clientId: Platform.select({
+      android: process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID,
+      ios: process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
+      web: process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
+    }),
+  });
 
   // ✅ SIMPLIFIED REFS - KHÔNG FOCUS STATE
   const usernameRef = useRef<TextInput>(null);
   const emailRef = useRef<TextInput>(null);
   const passwordRef = useRef<TextInput>(null);
   const confirmPasswordRef = useRef<TextInput>(null);
+
+  useEffect(() => {
+    if (response?.type === "success") {
+      const { id_token } = response.params;
+      handleGoogleSignIn(id_token);
+    }
+  }, [response]);
+
+  const handleGoogleSignIn = async (tokenId: string) => {
+    setLoading(true);
+    try {
+      const config = {
+        expoClientId: process.env.EXPO_PUBLIC_GOOGLE_EXPO_CLIENT_ID,
+        iosClientId: process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
+        androidClientId: process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID,
+        webClientId: process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
+      };
+
+      await AuthService.loginWithGoogle(config);
+      navigation.navigate("Trangchu");
+    } catch (error: any) {
+      console.error("❌ Google Sign In Error:", error);
+      Alert.alert("Lỗi", "Đăng nhập bằng Google thất bại");
+    } finally {
+      setLoading(false);
+    }
+  };
 
   // Validation helpers GIỮ NGUYÊN
   const isValidEmail = (email: string): boolean => {
@@ -98,6 +141,10 @@ const SignUpScreen: React.FC<Props> = ({ navigation }) => {
       Alert.alert("Lỗi", "Bạn cần đồng ý với Điều khoản và Chính sách bảo mật");
       return;
     }
+    if (!isCaptchaValid) {
+      Alert.alert("Lỗi", "Vui lòng nhập đúng mã xác minh");
+      return;
+    }
 
     setLoading(true);
     try {
@@ -126,6 +173,7 @@ const SignUpScreen: React.FC<Props> = ({ navigation }) => {
               setPassword("");
               setConfirmPassword("");
               setAgreeTerms(false);
+              setCaptchaValue("");
               navigation.navigate("Login");
             },
           },
@@ -344,6 +392,13 @@ const SignUpScreen: React.FC<Props> = ({ navigation }) => {
             )}
           </View>
 
+          {/* CAPTCHA */}
+          <Captcha
+            value={captchaValue}
+            onChangeText={setCaptchaValue}
+            onValidate={setIsCaptchaValid}
+          />
+
           {/* Terms Checkbox GIỮ NGUYÊN */}
           <TouchableOpacity
             style={styles.checkboxContainer}
@@ -391,7 +446,11 @@ const SignUpScreen: React.FC<Props> = ({ navigation }) => {
           </View>
 
           <View style={styles.socialButtonsContainer}>
-            <TouchableOpacity style={styles.socialButton} disabled={loading}>
+            <TouchableOpacity
+              style={styles.socialButton}
+              disabled={loading || !request}
+              onPress={() => promptAsync()}
+            >
               <Icon name="google" size={24} color="#DB4437" />
             </TouchableOpacity>
             <TouchableOpacity style={styles.socialButton} disabled={loading}>

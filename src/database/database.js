@@ -1,7 +1,7 @@
 import * as SQLite from "expo-sqlite";
 
 // Open or create database
-const db = SQLite.openDatabaseSync("familybudget.db");
+const db = SQLite.openDatabaseSync("family_budget.db");
 
 // Create all tables based on CSV data structure
 db.execSync(`
@@ -44,6 +44,7 @@ db.execSync(`
     display_order INTEGER DEFAULT 0,
     is_hidden BOOLEAN DEFAULT FALSE,
     created_at TEXT,
+    updated_at TEXT,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (parent_category_id) REFERENCES categories(id) ON DELETE SET NULL
   );
@@ -60,8 +61,8 @@ db.execSync(`
     payment_method TEXT,
     merchant_name TEXT,
     merchant_location TEXT,
-    latitude REAL,
-    longitude REAL,
+    location_lat REAL,
+    location_lng REAL,
     tags TEXT,
     is_synced BOOLEAN DEFAULT FALSE,
     last_modified_at TEXT,
@@ -385,6 +386,7 @@ db.execSync(`
   CREATE INDEX IF NOT EXISTS idx_recurring_next_occurrence ON recurring_transactions(next_occurrence);
   CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
   CREATE INDEX IF NOT EXISTS idx_reports_user_id ON reports(user_id);
+
 `);
 
 // Database service functions

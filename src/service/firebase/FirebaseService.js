@@ -1,16 +1,14 @@
 import {
+  addDoc,
   collection,
   doc,
-  getDocs,
   getDoc,
-  addDoc,
-  setDoc,
-  updateDoc,
-  deleteDoc,
-  query,
-  where,
+  getDocs,
   orderBy,
+  query,
   Timestamp,
+  updateDoc,
+  where,
   writeBatch,
 } from "firebase/firestore";
 import { dbInstance as db } from "../../firebaseConfig";
@@ -109,7 +107,8 @@ class FirebaseService {
   }
 
   async addTransaction(userId, transaction) {
-    const docRef = await addDoc(collection(db, "TRANSACTIONS"), {
+    // Prepare transaction data, filtering out undefined values
+    const transactionData = {
       transactionID: transaction.id,
       userID: userId,
       categoryID: transaction.category_id,
@@ -119,13 +118,33 @@ class FirebaseService {
       description: transaction.description || "",
       paymentMethod: transaction.payment_method,
       merchantName: transaction.merchant_name,
-      latitude: transaction.location_lat,
-      longitude: transaction.location_lng,
       isSynced: true,
       isDeleted: false,
       createdAt: Timestamp.now(),
       lastModifiedAt: Timestamp.now(),
-    });
+    };
+
+    // Only add location data if it exists and is not null
+    if (
+      transaction.location_lat !== undefined &&
+      transaction.location_lat !== null &&
+      transaction.location_lat !== 0
+    ) {
+      transactionData.location_lat = transaction.location_lat;
+    }
+
+    if (
+      transaction.location_lng !== undefined &&
+      transaction.location_lng !== null &&
+      transaction.location_lng !== 0
+    ) {
+      transactionData.location_lng = transaction.location_lng;
+    }
+
+    const docRef = await addDoc(
+      collection(db, "TRANSACTIONS"),
+      transactionData
+    );
     return docRef.id;
   }
 
@@ -270,6 +289,7 @@ class FirebaseService {
       createdAt: Timestamp.now(),
     });
   }
+
   // Thêm vào FirebaseService.js
   async getCategoryById(userId, categoryId) {
     const docRef = doc(db, `users/${userId}/categories/${categoryId}`);

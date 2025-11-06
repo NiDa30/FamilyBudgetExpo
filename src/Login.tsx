@@ -1,6 +1,9 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
+import * as Google from "expo-auth-session/providers/google";
+import * as WebBrowser from "expo-web-browser";
 import { signInWithEmailAndPassword } from "firebase/auth";
-import React, { useState, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -12,11 +15,14 @@ import {
   TextInput,
   TouchableOpacity,
   View,
-  // ✅ BỎ TouchableWithoutFeedback
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { RootStackParamList } from "../App";
+import Captcha from "./components/Captcha";
 import { authInstance as auth } from "./firebaseConfig";
+import { AuthService } from "./service/auth/auth";
+
+WebBrowser.maybeCompleteAuthSession();
 
 type LoginScreenNavigationProp = NativeStackNavigationProp<
   RootStackParamList,
@@ -32,10 +38,78 @@ const LoginScreen: React.FC<Props> = ({ navigation }) => {
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [captchaValue, setCaptchaValue] = useState("");
+  const [isCaptchaValid, setIsCaptchaValid] = useState(false);
+
+  const [request, response, promptAsync] = Google.useAuthRequest({
+    clientId: Platform.select({
+      android: process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID,
+      ios: process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
+      web: process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
+    }),
+  });
 
   // ✅ SIMPLIFIED REFS - KHÔNG FOCUS STATE
   const emailRef = useRef<TextInput>(null);
   const passwordRef = useRef<TextInput>(null);
+
+  useEffect(() => {
+    if (response?.type === "success") {
+      const { id_token } = response.params;
+      handleGoogleSignIn(id_token);
+    }
+  }, [response]);
+
+  const handleGoogleSignIn = async (tokenId: string) => {
+    setLoading(true);
+    try {
+      const config = {
+        expoClientId: process.env.EXPO_PUBLIC_GOOGLE_EXPO_CLIENT_ID,
+        iosClientId: process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
+        androidClientId: process.env.EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID,
+        webClientId: process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
+      };
+
+      const user = await AuthService.loginWithGoogle(config);
+
+      // Store user session token for persistent login
+      await storeUserSession(user);
+
+      navigation.navigate("Trangchu");
+    } catch (error: any) {
+      console.error("❌ Google Sign In Error:", error);
+      Alert.alert("Lỗi", "Đăng nhập bằng Google thất bại");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Store user session in AsyncStorage for persistent login
+  const storeUserSession = async (user: any) => {
+    try {
+      const userData = {
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName,
+        photoURL: user.photoURL,
+        refreshToken: user.refreshToken,
+      };
+      await AsyncStorage.setItem("userSession", JSON.stringify(userData));
+      console.log("✅ User session stored successfully");
+    } catch (error) {
+      console.error("❌ Error storing user session:", error);
+    }
+  };
+
+  // Clear user session from AsyncStorage
+  const clearUserSession = async () => {
+    try {
+      await AsyncStorage.removeItem("userSession");
+      console.log("✅ User session cleared successfully");
+    } catch (error) {
+      console.error("❌ Error clearing user session:", error);
+    }
+  };
 
   const handleLogin = async () => {
     if (loading) return;
@@ -54,9 +128,17 @@ const LoginScreen: React.FC<Props> = ({ navigation }) => {
       return;
     }
 
+    // Validate CAPTCHA
+    if (!isCaptchaValid) {
+      Alert.alert("Lỗi", "Vui lòng nhập đúng mã xác minh");
+      return;
+    }
+
     setLoading(true);
 
     try {
+      // Firebase Authentication will automatically compare the hashed password
+      // with the password entered by the user
       const userCredential = await signInWithEmailAndPassword(
         auth,
         trimmedEmail,
@@ -65,9 +147,13 @@ const LoginScreen: React.FC<Props> = ({ navigation }) => {
 
       console.log("✅ Đăng nhập thành công:", userCredential.user.email);
 
+      // Store user session token for persistent login
+      await storeUserSession(userCredential.user);
+
       // Clear form
       setEmail("");
       setPassword("");
+      setCaptchaValue("");
 
       navigation.navigate("Trangchu");
     } catch (error: any) {
@@ -189,6 +275,13 @@ const LoginScreen: React.FC<Props> = ({ navigation }) => {
             </View>
           </View>
 
+          {/* CAPTCHA */}
+          <Captcha
+            value={captchaValue}
+            onChangeText={setCaptchaValue}
+            onValidate={setIsCaptchaValid}
+          />
+
           {/* Forgot Password */}
           <TouchableOpacity
             style={styles.forgotPasswordContainer}
@@ -216,6 +309,29 @@ const LoginScreen: React.FC<Props> = ({ navigation }) => {
               </>
             )}
           </TouchableOpacity>
+
+          {/* Divider & Social Buttons */}
+          <View style={styles.dividerContainer}>
+            <View style={styles.dividerLine} />
+            <Text style={styles.dividerText}>Hoặc đăng nhập với</Text>
+            <View style={styles.dividerLine} />
+          </View>
+
+          <View style={styles.socialButtonsContainer}>
+            <TouchableOpacity
+              style={styles.socialButton}
+              disabled={loading || !request}
+              onPress={() => promptAsync()}
+            >
+              <Icon name="google" size={24} color="#DB4437" />
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.socialButton} disabled={loading}>
+              <Icon name="facebook" size={24} color="#4267B2" />
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.socialButton} disabled={loading}>
+              <Icon name="apple" size={24} color="#000" />
+            </TouchableOpacity>
+          </View>
 
           {/* Sign Up */}
           <View style={styles.signUpContainer}>
@@ -378,6 +494,43 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     fontSize: 16,
     letterSpacing: 0.5,
+  },
+  dividerContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginVertical: 28,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: "#E0E0E0",
+  },
+  dividerText: {
+    color: "#9E9E9E",
+    fontSize: 13,
+    marginHorizontal: 16,
+    fontWeight: "500",
+  },
+  socialButtonsContainer: {
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 16,
+    marginBottom: 28,
+  },
+  socialButton: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: "#fff",
+    justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 1.5,
+    borderColor: "#E0E0E0",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.06,
+    shadowRadius: 4,
+    elevation: 2,
   },
   signUpContainer: {
     flexDirection: "row",

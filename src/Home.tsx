@@ -1,18 +1,22 @@
-import React, { useState, useEffect } from "react";
+// src/Home.tsx
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { RouteProp, useNavigation, useRoute } from "@react-navigation/native";
+import { NativeStackNavigationProp } from "@react-navigation/native-stack";
+import React, { useEffect, useState } from "react";
 import {
-  View,
+  Alert,
+  FlatList,
+  StyleSheet,
   Text,
   TouchableOpacity,
-  StyleSheet,
-  FlatList,
-  Alert,
+  View,
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
-import { useNavigation, useRoute } from "@react-navigation/native";
-import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import { RouteProp } from "@react-navigation/native";
-import { RootStackParamList, Category } from "../App";
-import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Category, RootStackParamList } from "../App";
+
+// ĐÃ THÊM: DÙNG MÀU THEME
+import { useTheme } from "./context/ThemeContext";
+import { authInstance as auth } from "./firebaseConfig";
 
 type HomeScreenNavigationProp = NativeStackNavigationProp<
   RootStackParamList,
@@ -20,7 +24,28 @@ type HomeScreenNavigationProp = NativeStackNavigationProp<
 >;
 type HomeRouteProp = RouteProp<RootStackParamList, "Home">;
 
-// Định nghĩa categories mặc định cho CHI TIÊU
+// Transaction type definition
+interface Transaction {
+  id: string;
+  user_id: string;
+  category_id: string;
+  amount: number;
+  type: "EXPENSE" | "INCOME";
+  description: string;
+  date: number;
+  payment_method?: string;
+  merchant_name?: string;
+  location_lat?: number;
+  location_lng?: number;
+  created_at: number;
+  last_modified_at: number; // Changed from updated_at to last_modified_at
+  is_synced: number;
+  deleted_at?: number;
+  category_name?: string;
+  category_icon?: string;
+  category_color?: string;
+}
+
 const DEFAULT_EXPENSE_CATEGORIES: Category[] = [
   { id: "1", name: "Ăn uống", icon: "food-apple", color: "#FF6347", count: 29 },
   { id: "2", name: "Quần áo", icon: "tshirt-crew", color: "#32CD32", count: 5 },
@@ -53,7 +78,6 @@ const DEFAULT_EXPENSE_CATEGORIES: Category[] = [
   { id: "11", name: "Giáo dục", icon: "school", color: "#FFD700", count: 1 },
 ];
 
-// Định nghĩa categories mặc định cho THU NHẬP
 const DEFAULT_INCOME_CATEGORIES: Category[] = [
   {
     id: "i1",
@@ -81,6 +105,10 @@ const DEFAULT_INCOME_CATEGORIES: Category[] = [
 const Home: React.FC = () => {
   const navigation = useNavigation<HomeScreenNavigationProp>();
   const route = useRoute<HomeRouteProp>();
+
+  // DI CHUYỂN LÊN ĐẦU – TRƯỚC useState
+  const { themeColor } = useTheme();
+
   const [activeTab, setActiveTab] = useState<"expense" | "income">("expense");
   const [expenseCategories, setExpenseCategories] = useState<Category[]>(
     DEFAULT_EXPENSE_CATEGORIES
@@ -89,50 +117,119 @@ const Home: React.FC = () => {
     DEFAULT_INCOME_CATEGORIES
   );
 
-  // Lấy categories hiện tại dựa trên tab đang active
   const currentCategories =
     activeTab === "expense" ? expenseCategories : incomeCategories;
-  const totalCount = currentCategories.reduce((sum, cat) => sum + cat.count, 0);
 
-  // Tải danh sách categories từ AsyncStorage khi component mount
   useEffect(() => {
     const loadCategories = async () => {
       try {
-        const storedExpense = await AsyncStorage.getItem("expenseCategories");
-        const storedIncome = await AsyncStorage.getItem("incomeCategories");
+        const user = auth.currentUser;
+        if (!user?.uid) return;
 
-        if (storedExpense) {
-          const parsedExpense = JSON.parse(storedExpense);
-          if (Array.isArray(parsedExpense) && parsedExpense.length > 0) {
-            setExpenseCategories(parsedExpense);
+        // Load from SQLite first
+        try {
+          const DatabaseService = (await import("./database/databaseService"))
+            .default;
+          const allCategories = await DatabaseService.getCategoriesByUser(
+            user.uid
+          );
+
+          const expenseCats = allCategories
+            .filter((cat: any) => cat.type === "EXPENSE" || !cat.type)
+            .map((cat: any) => ({
+              id: cat.id,
+              name: cat.name,
+              icon: cat.icon || "tag",
+              color: cat.color || "#2196F3",
+              count: 0, // Count will be calculated separately if needed
+            }));
+
+          const incomeCats = allCategories
+            .filter((cat: any) => cat.type === "INCOME")
+            .map((cat: any) => ({
+              id: cat.id,
+              name: cat.name,
+              icon: cat.icon || "tag",
+              color: cat.color || "#2196F3",
+              count: 0,
+            }));
+
+          // If no expense categories, use defaults
+          if (expenseCats.length > 0) {
+            setExpenseCategories(expenseCats);
+            await AsyncStorage.setItem(
+              "expenseCategories",
+              JSON.stringify(expenseCats)
+            );
           } else {
+            setExpenseCategories(DEFAULT_EXPENSE_CATEGORIES);
             await AsyncStorage.setItem(
               "expenseCategories",
               JSON.stringify(DEFAULT_EXPENSE_CATEGORIES)
             );
           }
-        } else {
-          await AsyncStorage.setItem(
-            "expenseCategories",
-            JSON.stringify(DEFAULT_EXPENSE_CATEGORIES)
-          );
-        }
 
-        if (storedIncome) {
-          const parsedIncome = JSON.parse(storedIncome);
-          if (Array.isArray(parsedIncome) && parsedIncome.length > 0) {
-            setIncomeCategories(parsedIncome);
+          // If no income categories, use defaults
+          if (incomeCats.length > 0) {
+            setIncomeCategories(incomeCats);
+            await AsyncStorage.setItem(
+              "incomeCategories",
+              JSON.stringify(incomeCats)
+            );
           } else {
+            setIncomeCategories(DEFAULT_INCOME_CATEGORIES);
             await AsyncStorage.setItem(
               "incomeCategories",
               JSON.stringify(DEFAULT_INCOME_CATEGORIES)
             );
           }
-        } else {
-          await AsyncStorage.setItem(
-            "incomeCategories",
-            JSON.stringify(DEFAULT_INCOME_CATEGORIES)
+        } catch (sqliteError) {
+          console.warn(
+            "Failed to load from SQLite, using AsyncStorage:",
+            sqliteError
           );
+
+          // Fallback to AsyncStorage
+          const storedExpense = await AsyncStorage.getItem("expenseCategories");
+          const storedIncome = await AsyncStorage.getItem("incomeCategories");
+
+          if (storedExpense) {
+            const parsedExpense = JSON.parse(storedExpense);
+            if (Array.isArray(parsedExpense) && parsedExpense.length > 0) {
+              setExpenseCategories(parsedExpense);
+            } else {
+              setExpenseCategories(DEFAULT_EXPENSE_CATEGORIES);
+              await AsyncStorage.setItem(
+                "expenseCategories",
+                JSON.stringify(DEFAULT_EXPENSE_CATEGORIES)
+              );
+            }
+          } else {
+            setExpenseCategories(DEFAULT_EXPENSE_CATEGORIES);
+            await AsyncStorage.setItem(
+              "expenseCategories",
+              JSON.stringify(DEFAULT_EXPENSE_CATEGORIES)
+            );
+          }
+
+          if (storedIncome) {
+            const parsedIncome = JSON.parse(storedIncome);
+            if (Array.isArray(parsedIncome) && parsedIncome.length > 0) {
+              setIncomeCategories(parsedIncome);
+            } else {
+              setIncomeCategories(DEFAULT_INCOME_CATEGORIES);
+              await AsyncStorage.setItem(
+                "incomeCategories",
+                JSON.stringify(DEFAULT_INCOME_CATEGORIES)
+              );
+            }
+          } else {
+            setIncomeCategories(DEFAULT_INCOME_CATEGORIES);
+            await AsyncStorage.setItem(
+              "incomeCategories",
+              JSON.stringify(DEFAULT_INCOME_CATEGORIES)
+            );
+          }
         }
       } catch (error) {
         console.error("Error loading categories:", error);
@@ -141,7 +238,6 @@ const Home: React.FC = () => {
     loadCategories();
   }, []);
 
-  // Cập nhật danh sách khi nhận dữ liệu mới từ CategoryManagementScreen
   useEffect(() => {
     if (route.params?.updatedCategories) {
       const updatedCategories = route.params.updatedCategories;
@@ -165,32 +261,60 @@ const Home: React.FC = () => {
 
   const handleDeleteCategory = async (id: string) => {
     Alert.alert("Xóa phân loại", "Bạn có chắc muốn xóa phân loại này?", [
-      {
-        text: "Hủy",
-        style: "cancel",
-      },
+      { text: "Hủy", style: "cancel" },
       {
         text: "Xóa",
         style: "destructive",
         onPress: async () => {
-          if (activeTab === "expense") {
-            const updatedCategories = expenseCategories.filter(
-              (cat) => cat.id !== id
-            );
-            setExpenseCategories(updatedCategories);
-            await AsyncStorage.setItem(
-              "expenseCategories",
-              JSON.stringify(updatedCategories)
-            );
-          } else {
-            const updatedCategories = incomeCategories.filter(
-              (cat) => cat.id !== id
-            );
-            setIncomeCategories(updatedCategories);
-            await AsyncStorage.setItem(
-              "incomeCategories",
-              JSON.stringify(updatedCategories)
-            );
+          try {
+            const user = auth.currentUser;
+            if (!user?.uid) {
+              Alert.alert("Lỗi", "Người dùng chưa đăng nhập");
+              return;
+            }
+
+            // Update local state
+            if (activeTab === "expense") {
+              const updatedCategories = expenseCategories.filter(
+                (cat) => cat.id !== id
+              );
+              setExpenseCategories(updatedCategories);
+              await AsyncStorage.setItem(
+                "expenseCategories",
+                JSON.stringify(updatedCategories)
+              );
+            } else {
+              const updatedCategories = incomeCategories.filter(
+                (cat) => cat.id !== id
+              );
+              setIncomeCategories(updatedCategories);
+              await AsyncStorage.setItem(
+                "incomeCategories",
+                JSON.stringify(updatedCategories)
+              );
+            }
+
+            // Delete from SQLite and sync to Firebase
+            try {
+              const DatabaseService = (
+                await import("./database/databaseService")
+              ).default;
+              await DatabaseService.deleteCategory(id);
+
+              // Sync to Firebase
+              const FirebaseService = (
+                await import("./service/firebase/FirebaseService")
+              ).default;
+              await FirebaseService.deleteCategory(id);
+
+              console.log(`✅ Deleted category ${id} from SQLite and Firebase`);
+            } catch (syncError) {
+              console.warn("Failed to sync category deletion:", syncError);
+              // Category is still deleted locally, sync will retry later
+            }
+          } catch (error) {
+            console.error("Error deleting category:", error);
+            Alert.alert("Lỗi", "Không thể xóa phân loại");
           }
         },
       },
@@ -206,7 +330,6 @@ const Home: React.FC = () => {
   }) => (
     <View style={[styles.categoryCard, index === 0 && { marginTop: 16 }]}>
       <View style={styles.categoryContent}>
-        {/* Icon category với background tròn và shadow */}
         <View
           style={[
             styles.categoryIconContainer,
@@ -216,13 +339,11 @@ const Home: React.FC = () => {
           <Icon name={item.icon} size={28} color="#fff" />
         </View>
 
-        {/* Tên category và count */}
         <View style={styles.categoryInfo}>
           <Text style={styles.categoryName}>{item.name}</Text>
           <Text style={styles.categoryCount}>{item.count} giao dịch</Text>
         </View>
 
-        {/* Action buttons */}
         <View style={styles.actionButtons}>
           <TouchableOpacity style={styles.actionButton} activeOpacity={0.7}>
             <Icon name="pencil-outline" size={20} color="#757575" />
@@ -238,7 +359,6 @@ const Home: React.FC = () => {
         </View>
       </View>
 
-      {/* Drag handle */}
       <TouchableOpacity style={styles.dragHandle} activeOpacity={0.7}>
         <Icon name="drag-horizontal-variant" size={24} color="#BDBDBD" />
       </TouchableOpacity>
@@ -247,8 +367,8 @@ const Home: React.FC = () => {
 
   return (
     <View style={styles.container}>
-      {/* Header với gradient effect */}
-      <View style={styles.header}>
+      {/* Header – DÙNG MÀU THEME */}
+      <View style={[styles.header, { backgroundColor: themeColor }]}>
         <View style={styles.headerTop}>
           <TouchableOpacity
             onPress={() => navigation.navigate("Trangchu")}
@@ -261,10 +381,16 @@ const Home: React.FC = () => {
           <View style={styles.placeholder} />
         </View>
 
-        {/* Tab Container với thiết kế mới */}
+        {/* Tab – DÙNG MÀU THEME */}
         <View style={styles.tabContainer}>
           <TouchableOpacity
-            style={[styles.tab, activeTab === "expense" && styles.tabActive]}
+            style={[
+              styles.tab,
+              activeTab === "expense" && [
+                styles.tabActive,
+                { backgroundColor: themeColor },
+              ],
+            ]}
             onPress={() => setActiveTab("expense")}
             activeOpacity={0.8}
           >
@@ -303,7 +429,13 @@ const Home: React.FC = () => {
           </TouchableOpacity>
 
           <TouchableOpacity
-            style={[styles.tab, activeTab === "income" && styles.tabActive]}
+            style={[
+              styles.tab,
+              activeTab === "income" && [
+                styles.tabActive,
+                { backgroundColor: themeColor },
+              ],
+            ]}
             onPress={() => setActiveTab("income")}
             activeOpacity={0.8}
           >
@@ -343,10 +475,12 @@ const Home: React.FC = () => {
         </View>
       </View>
 
-      {/* Info banner */}
-      <View style={styles.infoBanner}>
-        <Icon name="information-outline" size={18} color="#1E88E5" />
-        <Text style={styles.infoText}>Kéo để sắp xếp lại thứ tự phân loại</Text>
+      {/* Info banner – DÙNG MÀU THEME */}
+      <View style={[styles.infoBanner, { backgroundColor: `${themeColor}15` }]}>
+        <Icon name="information-outline" size={18} color={themeColor} />
+        <Text style={[styles.infoText, { color: themeColor }]}>
+          Kéo để sắp xếp lại thứ tự phân loại
+        </Text>
       </View>
 
       {/* List categories */}
@@ -359,24 +493,29 @@ const Home: React.FC = () => {
         key={activeTab}
       />
 
-      {/* Nút thêm phân loại mới - Floating */}
+      {/* Nút thêm phân loại mới - Floating – DÙNG MÀU THEME */}
       <TouchableOpacity
-        style={styles.addButtonFloating}
+        style={[
+          styles.addButtonFloating,
+          { backgroundColor: themeColor, shadowColor: themeColor },
+        ]}
         onPress={() => navigation.navigate("Nhappl")}
         activeOpacity={0.9}
       >
         <Icon name="plus" size={28} color="#fff" />
       </TouchableOpacity>
 
-      {/* Bottom Add Button */}
+      {/* Bottom Add Button – DÙNG MÀU THEME */}
       <View style={styles.bottomContainer}>
         <TouchableOpacity
-          style={styles.addButton}
+          style={[styles.addButton, { backgroundColor: `${themeColor}15` }]}
           onPress={() => navigation.navigate("Nhappl")}
           activeOpacity={0.8}
         >
-          <Icon name="plus-circle-outline" size={22} color="#1E88E5" />
-          <Text style={styles.addButtonText}>Thêm phân loại mới</Text>
+          <Icon name="plus-circle-outline" size={22} color={themeColor} />
+          <Text style={[styles.addButtonText, { color: themeColor }]}>
+            Thêm phân loại mới
+          </Text>
         </TouchableOpacity>
       </View>
     </View>
@@ -389,7 +528,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#F5F7FA",
   },
   header: {
-    backgroundColor: "#1E88E5",
+    // ĐÃ XÓA backgroundColor: '#1E88E5'
     paddingTop: 40,
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 2 },
@@ -437,7 +576,7 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(255, 255, 255, 0.15)",
   },
   tabActive: {
-    backgroundColor: "rgba(255, 255, 255, 0.3)",
+    // backgroundColor: themeColor (được áp dụng trong component)
   },
   tabContent: {
     flexDirection: "row",
@@ -474,9 +613,9 @@ const styles = StyleSheet.create({
     color: "#fff",
   },
   infoBanner: {
+    // backgroundColor: `${themeColor}15` (được áp dụng trong component)
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "#E3F2FD",
     paddingHorizontal: 16,
     paddingVertical: 12,
     marginHorizontal: 16,
@@ -487,8 +626,8 @@ const styles = StyleSheet.create({
   infoText: {
     flex: 1,
     fontSize: 13,
-    color: "#1565C0",
     fontWeight: "500",
+    // color: themeColor (được áp dụng trong component)
   },
   listContent: {
     paddingHorizontal: 16,
@@ -571,7 +710,7 @@ const styles = StyleSheet.create({
   },
   addButton: {
     flexDirection: "row",
-    backgroundColor: "#E3F2FD",
+    // backgroundColor: `${themeColor}15` (được áp dụng trong component)
     paddingVertical: 14,
     alignItems: "center",
     justifyContent: "center",
@@ -581,8 +720,8 @@ const styles = StyleSheet.create({
   addButtonText: {
     fontSize: 15,
     fontWeight: "600",
-    color: "#1E88E5",
     letterSpacing: 0.3,
+    // color: themeColor (được áp dụng trong component)
   },
   addButtonFloating: {
     position: "absolute",
@@ -591,10 +730,9 @@ const styles = StyleSheet.create({
     width: 56,
     height: 56,
     borderRadius: 28,
-    backgroundColor: "#1E88E5",
+    // backgroundColor: themeColor (được áp dụng trong component)
     justifyContent: "center",
     alignItems: "center",
-    shadowColor: "#1E88E5",
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.3,
     shadowRadius: 8,

@@ -1,15 +1,15 @@
 // src/Nhap.tsx
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import DateTimePicker from "@react-native-community/datetimepicker";
 import {
   RouteProp,
+  useFocusEffect,
   useNavigation,
   useRoute,
-  useFocusEffect, // Đã có
 } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import React, { useEffect, useState, useCallback } from "react"; // Đã có
+import { useCallback, useEffect, useState } from "react"; // Đã có
 import {
+  ActivityIndicator,
   Alert,
   FlatList,
   Modal,
@@ -19,16 +19,15 @@ import {
   TextInput,
   TouchableOpacity,
   View,
-  ActivityIndicator,
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { Category, RootStackParamList } from "../App";
 import {
-  TransactionService,
   CategoryService,
+  TransactionService,
 } from "./database/databaseService";
-import SyncEngine from "./service/sync/SyncEngine";
 import { authInstance as auth } from "./firebaseConfig"; // Đã có
+import SyncEngine from "./service/sync/SyncEngine";
 
 type NhapGiaoDichNavigationProp = NativeStackNavigationProp<
   RootStackParamList,
@@ -285,13 +284,12 @@ const NhapGiaoDich = () => {
       await TransactionService.createTransaction(transactionData);
       console.log("✅ Transaction saved to SQLite");
 
-      SyncEngine.forceSyncNow(userId)
-        .then(() => {
-          console.log("✅ Transaction synced to Firebase");
-        })
-        .catch((err: any) => {
-          console.error("⚠️ Sync failed, will retry later:", err);
-        });
+      try {
+        await SyncEngine.performSync(userId, true);
+        console.log("✅ Transaction synced to Firebase");
+      } catch (err: any) {
+        console.error("⚠️ Sync failed, will retry later:", err);
+      }
 
       setAmount("0");
       setNote("");

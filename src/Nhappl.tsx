@@ -1,7 +1,8 @@
 import { useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import React, { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
   FlatList,
   ScrollView,
@@ -10,14 +11,12 @@ import {
   TextInput,
   TouchableOpacity,
   View,
-  ActivityIndicator,
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { RootStackParamList } from "../App";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { CategoryService as DatabaseService } from "./database/databaseService";
-import SyncEngine from "./service/sync/SyncEngine";
 import { authInstance as auth } from "./firebaseConfig"; // Sửa import
+import SyncEngine from "./service/sync/SyncEngine";
 
 type Category = {
   id: string;
@@ -290,7 +289,7 @@ const CategoryManagementScreen = () => {
       setIsSyncing(true);
 
       // Full sync: push local changes + pull remote changes
-      await SyncEngine.forceSyncNow(userId);
+      await SyncEngine.performSync(userId, true);
 
       // Reload từ SQLite
       await loadCategoriesFromSQLite();

@@ -12,14 +12,152 @@ import {
   mapTransactionToDb,
 } from "../domain/mappers";
 
-const db = SQLite.openDatabaseSync("familybudget.db");
+let db: SQLite.SQLiteDatabase | null = null;
+let dbInitPromise: Promise<SQLite.SQLiteDatabase> | null = null;
+const errorLogCache = new Set<string>();
+
+// エラーログを1回だけ表示するヘルパー関数
+function logErrorOnce(key: string, message: string, ...args: any[]) {
+  if (!errorLogCache.has(key)) {
+    errorLogCache.add(key);
+    console.error(message, ...args);
+  }
+}
+
+async function getDb(): Promise<SQLite.SQLiteDatabase> {
+  // 既に初期化中の場合は、そのPromiseを待つ
+  if (dbInitPromise) {
+    return dbInitPromise;
+  }
+
+  if (!db) {
+    dbInitPromise = (async () => {
+      try {
+        // ✅ ENSURE DATABASE IS INITIALIZED FIRST
+        const databaseServiceModule = await import("./databaseService");
+        const databaseService =
+          databaseServiceModule.default ||
+          databaseServiceModule.DatabaseService;
+        
+        // databaseServiceがクラスインスタンスの場合
+        if (databaseService && typeof databaseService.ensureInitialized === "function") {
+          await databaseService.ensureInitialized();
+        } else if (databaseService && databaseService.db) {
+          // 既に初期化されている場合は、そのインスタンスを使用
+          db = databaseService.db;
+          if (db) {
+            dbInitPromise = null;
+            return db;
+          }
+        }
+        
+        // Open database with consistent name
+        db = await SQLite.openDatabaseAsync("family_budget.db");
+        if (!db) {
+          throw new Error("Failed to open database");
+        }
+        
+        dbInitPromise = null;
+        return db;
+      } catch (error) {
+        dbInitPromise = null;
+        logErrorOnce("db_init_error", "Error opening database:", error);
+        // エラーが発生しても、空のデータベースインスタンスを返すのではなく、エラーを再スロー
+        // ただし、NullPointerExceptionの場合は空の配列を返すようにする
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (errorMessage.includes("NullPointerException")) {
+          // NullPointerExceptionの場合は、空のデータベースインスタンスを作成しようとする
+          try {
+            db = await SQLite.openDatabaseAsync("family_budget.db");
+            if (db) {
+              dbInitPromise = null;
+              return db;
+            }
+          } catch (retryError) {
+            // リトライも失敗した場合は、エラーをログに記録
+            logErrorOnce("db_init_retry_error", "Failed to retry database initialization:", retryError);
+          }
+        }
+        throw error;
+      }
+    })();
+    
+    return dbInitPromise;
+  }
+  return db;
+}
 
 async function runAsync<T = unknown>(
   sql: string,
   params: any[] = []
 ): Promise<{ rows: any[]; rowsAffected: number } & T> {
-  const result = await db.execAsync(sql, params);
-  return result as any;
+  try {
+    const database = await getDb();
+    if (!database) {
+      logErrorOnce("db_null_error", "Database is null after getDb()");
+      return { rows: [], rowsAffected: 0 } as any;
+    }
+    
+    if (sql.trim().toUpperCase().startsWith("SELECT")) {
+      try {
+        const rows = await database.getAllAsync(sql, params);
+        // Ensure rows is always an array
+        if (!rows) {
+          return { rows: [], rowsAffected: 0 } as any;
+        }
+        if (!Array.isArray(rows)) {
+          return { rows: [], rowsAffected: 0 } as any;
+        }
+        return { rows: rows, rowsAffected: 0 } as any;
+      } catch (queryError: any) {
+        // NullPointerExceptionエラーの場合のみログを抑制
+        const errorKey = `query_error_${sql.substring(0, 50)}_${queryError?.message || 'unknown'}`;
+        const errorMessage = queryError?.message || String(queryError);
+        
+        if (errorMessage.includes("NullPointerException")) {
+          // NullPointerExceptionの場合は、エラーの種類と回数のみを記録
+          logErrorOnce(
+            "db_nullpointer_error",
+            `Database query error (NullPointerException): ${sql.substring(0, 50)}... (This error occurred multiple times)`
+          );
+        } else {
+          logErrorOnce(errorKey, "Query execution error:", queryError);
+        }
+        return { rows: [], rowsAffected: 0 } as any;
+      }
+    } else {
+      try {
+        const result = await database.runAsync(sql, params);
+        return { rows: [], rowsAffected: result?.changes || 0 } as any;
+      } catch (queryError: any) {
+        const errorKey = `run_error_${sql.substring(0, 50)}_${queryError?.message || 'unknown'}`;
+        const errorMessage = queryError?.message || String(queryError);
+        
+        if (errorMessage.includes("NullPointerException")) {
+          logErrorOnce(
+            "db_nullpointer_run_error",
+            `Database run error (NullPointerException): ${sql.substring(0, 50)}... (This error occurred multiple times)`
+          );
+        } else {
+          logErrorOnce(errorKey, "Query execution error:", queryError);
+        }
+        return { rows: [], rowsAffected: 0 } as any;
+      }
+    }
+  } catch (error: any) {
+    const errorKey = `runasync_error_${error?.message || 'unknown'}`;
+    const errorMessage = error?.message || String(error);
+    
+    if (errorMessage.includes("NullPointerException")) {
+      logErrorOnce(
+        "db_nullpointer_runasync_error",
+        `Database operation error (NullPointerException): ${errorMessage} (This error occurred multiple times)`
+      );
+    } else {
+      logErrorOnce(errorKey, "runAsync error:", error);
+    }
+    return { rows: [], rowsAffected: 0 } as any;
+  }
 }
 
 export const TransactionRepository = {
@@ -173,10 +311,25 @@ export const TransactionRepository = {
 
 export const CategoryRepository = {
   async listByUser(userId: UUID): Promise<Category[]> {
-    const { rows } = await runAsync(
-      "SELECT * FROM categories WHERE user_id IS NULL OR user_id = ? ORDER BY display_order ASC, name ASC",
-      [userId]
-    );
-    return rows.map(mapRowToCategory);
+    try {
+      if (!userId) {
+        logErrorOnce("category_userid_null", "CategoryRepository.listByUser: userId is null or undefined");
+        return [];
+      }
+      
+      const result = await runAsync(
+        "SELECT * FROM categories WHERE user_id IS NULL OR user_id = ? ORDER BY display_order ASC, name ASC",
+        [userId]
+      );
+      
+      if (!result || !result.rows || !Array.isArray(result.rows)) {
+        return [];
+      }
+      
+      return result.rows.map(mapRowToCategory);
+    } catch (error) {
+      logErrorOnce("category_list_error", "CategoryRepository.listByUser error:", error);
+      return [];
+    }
   },
 };

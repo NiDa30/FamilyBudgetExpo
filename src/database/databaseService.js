@@ -1,5 +1,10 @@
 // src/database/databaseService.js
 import * as SQLite from "expo-sqlite";
+import {
+  addMissingTransactionColumns,
+  fixCategoryIdConstraint,
+  runMigrations,
+} from "./migrations"; // Update import
 
 class DatabaseService {
   constructor() {
@@ -10,12 +15,12 @@ class DatabaseService {
 
   async initialize() {
     if (this.initPromise) {
-      console.log("⏳ Database initialization already in progress...");
+      console.log("Database initialization already in progress...");
       return this.initPromise;
     }
 
     if (this.isInitialized) {
-      console.log("✅ Database already initialized");
+      console.log("Database already initialized");
       return;
     }
 
@@ -29,16 +34,25 @@ class DatabaseService {
 
   async _doInitialize() {
     try {
-      console.log("🔧 Opening SQLite database...");
+      console.log("Opening SQLite database...");
       this.db = await SQLite.openDatabaseAsync("family_budget.db");
 
-      console.log("🔧 Creating tables...");
+      console.log("Creating tables...");
       await this.createTables();
 
+      console.log("Adding missing transaction columns...");
+      await addMissingTransactionColumns(this.db);
+
+      console.log("Running database migrations...");
+      await runMigrations(this.db);
+
+      console.log("Fixing category_id constraint...");
+      await fixCategoryIdConstraint(this.db); // Update this line
+
       this.isInitialized = true;
-      console.log("✅ SQLite Database initialized successfully");
+      console.log("SQLite Database initialized successfully");
     } catch (error) {
-      console.error("❌ Failed to initialize database:", error);
+      console.error("Failed to initialize database:", error);
       this.isInitialized = false;
       this.db = null;
       throw error;
@@ -67,17 +81,32 @@ class DatabaseService {
       CREATE TABLE IF NOT EXISTS transactions (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
-        category_id TEXT NOT NULL,
+        category_id TEXT,
         amount REAL NOT NULL,
-        type TEXT NOT NULL,
+        type TEXT CHECK(type IN ('INCOME', 'EXPENSE')),
+        date TEXT NOT NULL,
         description TEXT,
-        date INTEGER NOT NULL,
         payment_method TEXT,
         merchant_name TEXT,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        is_synced INTEGER DEFAULT 0,
-        deleted_at INTEGER DEFAULT NULL
+        merchant_location TEXT,
+        location_lat REAL,
+        location_lng REAL,
+        tags TEXT,
+        is_synced BOOLEAN DEFAULT FALSE,
+        last_modified_at TEXT,
+        location TEXT,
+        is_deleted BOOLEAN DEFAULT FALSE,
+        deleted_at TEXT,
+        created_by TEXT,
+        has_attachment BOOLEAN DEFAULT FALSE,
+        recur_txn_id TEXT,
+        parent_transaction_id TEXT,
+        created_at TEXT,
+        updated_at TEXT,  -- THÊM CỘT NÀY ĐỂ TƯƠNG THÍCH DB CŨ
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL,
+        FOREIGN KEY (recur_txn_id) REFERENCES transactions(id) ON DELETE SET NULL,
+        FOREIGN KEY (parent_transaction_id) REFERENCES transactions(id) ON DELETE SET NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_categories_user_id ON categories(user_id);
@@ -85,14 +114,15 @@ class DatabaseService {
       CREATE INDEX IF NOT EXISTS idx_categories_updated ON categories(updated_at);
       CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);
       CREATE INDEX IF NOT EXISTS idx_transactions_sync ON transactions(is_synced);
+      CREATE INDEX IF NOT EXISTS idx_transactions_last_modified ON transactions(last_modified_at);
     `);
 
-    console.log("✅ Tables created successfully");
+    console.log("Tables created successfully");
   }
 
   async ensureInitialized() {
     if (!this.isInitialized) {
-      console.log("⚠️ Database not initialized, initializing now...");
+      console.log("Database not initialized, initializing now...");
       await this.initialize();
     }
   }
@@ -101,7 +131,6 @@ class DatabaseService {
 
   async getCategoriesByUser(userId) {
     await this.ensureInitialized();
-
     return await this.db.getAllAsync(
       `SELECT * FROM categories 
        WHERE user_id = ? AND deleted_at IS NULL 
@@ -110,10 +139,8 @@ class DatabaseService {
     );
   }
 
-  // ✅ DELTA SYNC: Chỉ lấy categories thay đổi sau lastSyncTime
   async getCategoriesSince(userId, lastSyncTime) {
     await this.ensureInitialized();
-
     return await this.db.getAllAsync(
       `SELECT * FROM categories 
        WHERE user_id = ? 
@@ -126,14 +153,13 @@ class DatabaseService {
 
   async createCategory(category) {
     await this.ensureInitialized();
-
     const now = Date.now();
 
     await this.db.runAsync(
-      `INSERT INTO categories (
+      `INSERT OR REPLACE INTO categories (
         id, user_id, name, type, budget_group, icon, color,
-        is_system_default, created_at, updated_at, is_synced
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+        is_system_default, created_at, updated_at, is_synced, deleted_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM categories WHERE id = ?), ?), ?, 0, NULL)`,
       [
         category.id,
         category.user_id,
@@ -143,18 +169,17 @@ class DatabaseService {
         category.icon || "food-apple",
         category.color || "#FF6347",
         category.is_system_default || 0,
-        now,
-        now,
+        category.id, // For COALESCE to preserve existing created_at
+        now, // Fallback created_at if new
+        now, // updated_at
       ]
     );
 
-    console.log("✅ Category saved to SQLite:", category.name);
     return { ...category, created_at: now, updated_at: now };
   }
 
   async updateCategory(categoryId, updates) {
     await this.ensureInitialized();
-
     const now = Date.now();
     const fields = [];
     const values = [];
@@ -177,7 +202,6 @@ class DatabaseService {
 
   async deleteCategory(categoryId) {
     await this.ensureInitialized();
-
     const now = Date.now();
     await this.db.runAsync(
       `UPDATE categories SET deleted_at = ?, updated_at = ?, is_synced = 0 WHERE id = ?`,
@@ -185,184 +209,22 @@ class DatabaseService {
     );
   }
 
-  async addDefaultCategories(userId) {
-    await this.ensureInitialized();
-
-    console.log("📝 Adding default categories for user:", userId);
-
-    const defaultCategories = [
-      {
-        name: "Ăn uống",
-        icon: "food-apple",
-        color: "#FF6347",
-        budget_group: "Nhu cầu",
-      },
-      {
-        name: "Mua sắm",
-        icon: "shopping",
-        color: "#FF69B4",
-        budget_group: "Muốn",
-      },
-      {
-        name: "Giao thông",
-        icon: "car",
-        color: "#4169E1",
-        budget_group: "Nhu cầu",
-      },
-      {
-        name: "Y tế",
-        icon: "hospital-box",
-        color: "#32CD32",
-        budget_group: "Nhu cầu",
-      },
-      {
-        name: "Giải trí",
-        icon: "gamepad-variant",
-        color: "#FFD700",
-        budget_group: "Muốn",
-      },
-      {
-        name: "Giáo dục",
-        icon: "school",
-        color: "#9370DB",
-        budget_group: "Nhu cầu",
-      },
-      {
-        name: "Tiết kiệm",
-        icon: "piggy-bank",
-        color: "#2E8B57",
-        budget_group: "Tiết kiệm",
-      },
-      {
-        name: "Thu nhập",
-        icon: "cash-multiple",
-        color: "#00CED1",
-        budget_group: "Thu nhập",
-        type: "INCOME",
-      },
-    ];
-
-    let addedCount = 0;
-
-    for (const cat of defaultCategories) {
-      try {
-        const now = Date.now();
-        const id = `default_${cat.name}_${now}_${Math.random()
-          .toString(36)
-          .substr(2, 5)}`;
-
-        await this.db.runAsync(
-          `INSERT INTO categories (
-            id, user_id, name, type, budget_group, icon, color,
-            is_system_default, created_at, updated_at, is_synced
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 0)`,
-          [
-            id,
-            userId,
-            cat.name,
-            cat.type || "EXPENSE",
-            cat.budget_group,
-            cat.icon,
-            cat.color,
-            now,
-            now,
-          ]
-        );
-
-        addedCount++;
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      } catch (error) {
-        console.error(`✗ Failed to add ${cat.name}:`, error);
-      }
-    }
-
-    console.log(
-      `✅ Added ${addedCount}/${defaultCategories.length} default categories`
-    );
-  }
-
-  // ==================== TRANSACTIONS ====================
-
-  async addTransaction(transaction) {
-    await this.ensureInitialized();
-
-    const now = Date.now();
-
-    await this.db.runAsync(
-      `INSERT INTO transactions (
-        id, user_id, category_id, amount, type, description,
-        date, payment_method, merchant_name, created_at, updated_at, is_synced
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-      [
-        transaction.id,
-        transaction.user_id,
-        transaction.category_id,
-        transaction.amount,
-        transaction.type,
-        transaction.description || "",
-        transaction.date || Date.now(),
-        transaction.payment_method || "",
-        transaction.merchant_name || "",
-        now,
-        now,
-      ]
-    );
-
-    return { ...transaction, created_at: now, updated_at: now };
-  }
-
-  async getTransactionsSince(userId, lastSyncTime) {
-    await this.ensureInitialized();
-
-    return await this.db.getAllAsync(
-      `SELECT * FROM transactions 
-       WHERE user_id = ? 
-       AND updated_at > ? 
-       AND deleted_at IS NULL
-       ORDER BY updated_at ASC`,
-      [userId, lastSyncTime]
-    );
-  }
-
-  // ==================== SYNC HELPERS ====================
-
-  async getUnsyncedRecords(tableName) {
-    await this.ensureInitialized();
-
-    return await this.db.getAllAsync(
-      `SELECT * FROM ${tableName} WHERE is_synced = 0 AND deleted_at IS NULL`
-    );
-  }
-
-  async markAsSynced(tableName, recordId) {
-    await this.ensureInitialized();
-
-    await this.db.runAsync(
-      `UPDATE ${tableName} SET is_synced = 1 WHERE id = ?`,
-      [recordId]
-    );
-  }
-
-  async clearUserData(userId) {
-    await this.ensureInitialized();
-
-    await this.db.execAsync(`
-      DELETE FROM categories WHERE user_id = '${userId}' AND is_system_default = 0;
-      DELETE FROM transactions WHERE user_id = '${userId}';
-    `);
-  }
   // ==================== TRANSACTIONS ====================
 
   async createTransaction(transaction) {
     await this.ensureInitialized();
 
-    const now = Date.now();
+    const now = new Date().toISOString();
+    const createdAt = transaction.created_at || now;
+    const updatedAt = transaction.updated_at || now; // TỰ ĐỘNG ĐIỀN NẾU THIẾU
+    const lastModifiedAt = transaction.last_modified_at || now;
 
     await this.db.runAsync(
       `INSERT INTO transactions (
         id, user_id, category_id, amount, type, description,
-        date, payment_method, merchant_name, created_at, updated_at, is_synced
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+        date, payment_method, merchant_name, location_lat, location_lng,
+        created_at, updated_at, last_modified_at, is_synced
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
       [
         transaction.id,
         transaction.user_id,
@@ -370,18 +232,24 @@ class DatabaseService {
         transaction.amount,
         transaction.type,
         transaction.description || "",
-        typeof transaction.date === "string"
-          ? new Date(transaction.date).getTime()
-          : transaction.date,
+        transaction.date || now,
         transaction.payment_method || "CASH",
         transaction.merchant_name || "",
-        now,
-        now,
+        transaction.location_lat ?? null,
+        transaction.location_lng ?? null,
+        createdAt,
+        updatedAt, // ĐẢM BẢO CÓ updated_at
+        lastModifiedAt, // Đồng bộ với last_modified_at
       ]
     );
 
-    console.log("✅ Transaction saved to SQLite:", transaction.id);
-    return { ...transaction, created_at: now, updated_at: now };
+    console.log("Transaction saved to SQLite:", transaction.id);
+    return {
+      ...transaction,
+      created_at: createdAt,
+      updated_at: updatedAt,
+      lastModifiedAt,
+    };
   }
 
   async getTransactionsByUser(userId, options = {}) {
@@ -395,7 +263,6 @@ class DatabaseService {
     `;
     const params = [userId];
 
-    // Filter by date range
     if (options.startDate) {
       query += " AND t.date >= ?";
       params.push(options.startDate);
@@ -404,11 +271,14 @@ class DatabaseService {
       query += " AND t.date <= ?";
       params.push(options.endDate);
     }
-
-    // Filter by type
     if (options.type) {
       query += " AND t.type = ?";
       params.push(options.type);
+    }
+    // Add category filtering support
+    if (options.categoryId) {
+      query += " AND t.category_id = ?";
+      params.push(options.categoryId);
     }
 
     query += " ORDER BY t.date DESC";
@@ -418,7 +288,6 @@ class DatabaseService {
 
   async getTransactionById(transactionId) {
     await this.ensureInitialized();
-
     return await this.db.getFirstAsync(
       "SELECT * FROM transactions WHERE id = ?",
       [transactionId]
@@ -428,19 +297,23 @@ class DatabaseService {
   async updateTransaction(transactionId, updates) {
     await this.ensureInitialized();
 
-    const now = Date.now();
+    const now = new Date().toISOString();
     const fields = [];
     const values = [];
 
     Object.keys(updates).forEach((key) => {
-      if (key !== "updated_at" && key !== "is_synced") {
+      if (
+        key !== "last_modified_at" &&
+        key !== "updated_at" &&
+        key !== "is_synced"
+      ) {
         fields.push(`${key} = ?`);
         values.push(updates[key]);
       }
     });
 
-    fields.push("updated_at = ?", "is_synced = ?");
-    values.push(now, 0, transactionId);
+    fields.push("updated_at = ?", "last_modified_at = ?", "is_synced = ?");
+    values.push(now, now, 0, transactionId);
 
     await this.db.runAsync(
       `UPDATE transactions SET ${fields.join(", ")} WHERE id = ?`,
@@ -450,71 +323,345 @@ class DatabaseService {
 
   async deleteTransaction(transactionId) {
     await this.ensureInitialized();
-
-    const now = Date.now();
+    const now = new Date().toISOString();
     await this.db.runAsync(
-      `UPDATE transactions SET deleted_at = ?, updated_at = ?, is_synced = 0 WHERE id = ?`,
-      [now, now, transactionId]
+      `UPDATE transactions SET deleted_at = ?, updated_at = ?, last_modified_at = ?, is_synced = 0 WHERE id = ?`,
+      [now, now, now, transactionId]
     );
   }
 
-  // Delta Sync: Get transactions changed after lastSyncTime
   async getTransactionsSince(userId, lastSyncTime) {
     await this.ensureInitialized();
-
     return await this.db.getAllAsync(
       `SELECT * FROM transactions 
        WHERE user_id = ? 
-       AND updated_at > ? 
+       AND last_modified_at > ? 
        AND deleted_at IS NULL
-       ORDER BY updated_at ASC`,
+       ORDER BY last_modified_at ASC`,
       [userId, lastSyncTime]
     );
   }
 
-  // Get transactions by category for statistics
-  async getTransactionsByCategory(userId, categoryId, startDate, endDate) {
+  // ✅ ADD MISSING METHOD: getUnsyncedRecords
+  async getUnsyncedRecords(tableName) {
     await this.ensureInitialized();
-
-    return await this.db.getAllAsync(
-      `SELECT * FROM transactions 
-       WHERE user_id = ? 
-       AND category_id = ? 
-       AND date >= ? 
-       AND date <= ? 
-       AND deleted_at IS NULL
-       ORDER BY date DESC`,
-      [userId, categoryId, startDate, endDate]
-    );
+    if (tableName === "categories") {
+      return await this.db.getAllAsync(
+        `SELECT * FROM categories 
+         WHERE (is_synced = 0 OR is_synced IS NULL) 
+         AND deleted_at IS NULL
+         ORDER BY updated_at ASC`
+      );
+    } else if (tableName === "transactions") {
+      return await this.db.getAllAsync(
+        `SELECT * FROM transactions 
+         WHERE (is_synced = 0 OR is_synced IS NULL) 
+         AND deleted_at IS NULL
+         ORDER BY updated_at ASC`
+      );
+    }
+    return [];
   }
 
-  // Get transaction summary
-  async getTransactionSummary(userId, startDate, endDate) {
+  // ✅ ADD MISSING METHOD: markAsSynced
+  async markAsSynced(tableName, recordId) {
     await this.ensureInitialized();
-
-    const result = await this.db.getFirstAsync(
-      `SELECT 
-        SUM(CASE WHEN type = 'EXPENSE' THEN amount ELSE 0 END) as total_expense,
-        SUM(CASE WHEN type = 'INCOME' THEN amount ELSE 0 END) as total_income,
-        COUNT(*) as transaction_count
-       FROM transactions 
-       WHERE user_id = ? 
-       AND date >= ? 
-       AND date <= ? 
-       AND deleted_at IS NULL`,
-      [userId, startDate, endDate]
-    );
-
-    return (
-      result || { total_expense: 0, total_income: 0, transaction_count: 0 }
-    );
+    const now = Date.now();
+    if (tableName === "categories") {
+      await this.db.runAsync(
+        `UPDATE categories SET is_synced = 1, updated_at = ? WHERE id = ?`,
+        [now, recordId]
+      );
+    } else if (tableName === "transactions") {
+      await this.db.runAsync(
+        `UPDATE transactions SET is_synced = 1, updated_at = ?, last_modified_at = ? WHERE id = ?`,
+        [now, new Date().toISOString(), recordId]
+      );
+    }
   }
 }
 
 const databaseService = new DatabaseService();
 
+// Add default categories function with Firebase sync
+export async function addDefaultCategories(userId) {
+  await databaseService.ensureInitialized();
+
+  // Check if categories already exist
+  const existingCategories = await databaseService.getCategoriesByUser(userId);
+  if (existingCategories && existingCategories.length > 0) {
+    console.log(
+      `User ${userId} already has ${existingCategories.length} categories, skipping default creation`
+    );
+    return;
+  }
+
+  const defaultCategories = [
+    // Expense categories
+    {
+      id: `cat_food_${userId}`,
+      name: "Ăn uống",
+      type: "EXPENSE",
+      icon: "food-fork-drink",
+      color: "#FF6B6B",
+      budget_group: "Nhu cầu",
+    },
+    {
+      id: `cat_transport_${userId}`,
+      name: "Di chuyển",
+      type: "EXPENSE",
+      icon: "car",
+      color: "#4ECDC4",
+      budget_group: "Nhu cầu",
+    },
+    {
+      id: `cat_house_${userId}`,
+      name: "Nhà cửa",
+      type: "EXPENSE",
+      icon: "home",
+      color: "#45B7D1",
+      budget_group: "Nhu cầu",
+    },
+    {
+      id: `cat_utility_${userId}`,
+      name: "Tiện ích",
+      type: "EXPENSE",
+      icon: "lightning-bolt",
+      color: "#96CEB4",
+      budget_group: "Nhu cầu",
+    },
+    {
+      id: `cat_health_${userId}`,
+      name: "Sức khỏe",
+      type: "EXPENSE",
+      icon: "heart-plus",
+      color: "#FFEAA7",
+      budget_group: "Nhu cầu",
+    },
+    {
+      id: `cat_education_${userId}`,
+      name: "Giáo dục",
+      type: "EXPENSE",
+      icon: "school",
+      color: "#DDA0DD",
+      budget_group: "Nhu cầu",
+    },
+    {
+      id: `cat_clothing_${userId}`,
+      name: "Ăn mặc",
+      type: "EXPENSE",
+      icon: "tshirt-crew",
+      color: "#98D8C8",
+      budget_group: "Nhu cầu",
+    },
+    {
+      id: `cat_entertainment_${userId}`,
+      name: "Giải trí",
+      type: "EXPENSE",
+      icon: "movie",
+      color: "#F7DC6F",
+      budget_group: "Tiết kiệm",
+    },
+    {
+      id: `cat_travel_${userId}`,
+      name: "Du lịch",
+      type: "EXPENSE",
+      icon: "airplane",
+      color: "#BB8FCE",
+      budget_group: "Tiết kiệm",
+    },
+    {
+      id: `cat_shopping_${userId}`,
+      name: "Mua sắm",
+      type: "EXPENSE",
+      icon: "cart",
+      color: "#F8C471",
+      budget_group: "Tiết kiệm",
+    },
+    {
+      id: `cat_gift_${userId}`,
+      name: "Biếu tặng",
+      type: "EXPENSE",
+      icon: "gift",
+      color: "#85C1E9",
+      budget_group: "Đầu tư",
+    },
+    {
+      id: `cat_other_expense_${userId}`,
+      name: "Chi tiêu khác",
+      type: "EXPENSE",
+      icon: "dots-horizontal",
+      color: "#D5D8DC",
+      budget_group: "Khác",
+    },
+
+    // Income categories
+    {
+      id: `cat_salary_${userId}`,
+      name: "Lương",
+      type: "INCOME",
+      icon: "cash",
+      color: "#27AE60",
+      budget_group: "Thu nhập",
+    },
+    {
+      id: `cat_bonus_${userId}`,
+      name: "Thưởng",
+      type: "INCOME",
+      icon: "gift",
+      color: "#2ECC71",
+      budget_group: "Thu nhập",
+    },
+    {
+      id: `cat_investment_${userId}`,
+      name: "Đầu tư",
+      type: "INCOME",
+      icon: "chart-line",
+      color: "#3498DB",
+      budget_group: "Thu nhập",
+    },
+    {
+      id: `cat_business_${userId}`,
+      name: "Kinh doanh",
+      type: "INCOME",
+      icon: "briefcase",
+      color: "#9B59B6",
+      budget_group: "Thu nhập",
+    },
+    {
+      id: `cat_other_income_${userId}`,
+      name: "Thu nhập khác",
+      type: "INCOME",
+      icon: "dots-horizontal",
+      color: "#D5D8DC",
+      budget_group: "Thu nhập",
+    },
+  ];
+
+  // Create each category
+  for (const category of defaultCategories) {
+    try {
+      await databaseService.createCategory({
+        id: category.id,
+        user_id: userId,
+        name: category.name,
+        type: category.type,
+        budget_group: category.budget_group,
+        icon: category.icon,
+        color: category.color,
+        is_system_default: 1,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      });
+
+      // Sync to Firebase if available
+      try {
+        const FirebaseService = (
+          await import("../service/firebase/FirebaseService")
+        ).default;
+        await FirebaseService.addCategory(userId, {
+          id: category.id,
+          name: category.name,
+          type: category.type,
+          icon: category.icon,
+          color: category.color,
+          isSystemDefault: true,
+          displayOrder: 0,
+          isHidden: false,
+        });
+        await databaseService.markAsSynced("categories", category.id);
+        console.log(`✅ Synced category "${category.name}" to Firebase`);
+      } catch (firebaseError) {
+        console.warn(
+          `Failed to sync category "${category.name}" to Firebase:`,
+          firebaseError
+        );
+      }
+    } catch (error) {
+      console.warn(
+        `Failed to create default category ${category.name}:`,
+        error
+      );
+    }
+  }
+
+  console.log(
+    `✅ Created ${defaultCategories.length} default categories for user ${userId}`
+  );
+}
+
+// ✅ NEW FUNCTION: Initialize categories if not exists and sync to Firebase
+export async function ensureCategoriesInitialized(userId) {
+  try {
+    await databaseService.ensureInitialized();
+
+    // Check if user has any categories
+    const existingCategories = await databaseService.getCategoriesByUser(userId);
+
+    if (existingCategories && existingCategories.length > 0) {
+      console.log(
+        `✅ User ${userId} already has ${existingCategories.length} categories`
+      );
+
+      // Check if any categories need Firebase sync
+      const unsyncedCategories = existingCategories.filter(
+        (cat) => !cat.is_synced || cat.is_synced === 0
+      );
+
+      if (unsyncedCategories.length > 0 && userId) {
+        console.log(
+          `🔄 Syncing ${unsyncedCategories.length} unsynced categories to Firebase...`
+        );
+
+        try {
+          const FirebaseService = (
+            await import("../service/firebase/FirebaseService")
+          ).default;
+
+          for (const category of unsyncedCategories) {
+            try {
+              await FirebaseService.addCategory(userId, {
+                id: category.id,
+                name: category.name,
+                type: category.type || "EXPENSE",
+                icon: category.icon,
+                color: category.color,
+                isSystemDefault: category.is_system_default === 1,
+                displayOrder: category.display_order || 0,
+                isHidden: category.is_hidden === 1,
+              });
+
+              await databaseService.markAsSynced("categories", category.id);
+              console.log(`✅ Synced category "${category.name}" to Firebase`);
+            } catch (syncError) {
+              console.warn(
+                `Failed to sync category "${category.name}" to Firebase:`,
+                syncError
+              );
+            }
+          }
+        } catch (firebaseError) {
+          console.warn("FirebaseService not available:", firebaseError);
+        }
+      }
+
+      return;
+    }
+
+    // No categories found, create default ones
+    console.log(
+      `📝 No categories found for user ${userId}, creating default categories...`
+    );
+    await addDefaultCategories(userId);
+  } catch (error) {
+    console.error("Error ensuring categories initialized:", error);
+    throw error;
+  }
+}
+
 export default databaseService;
 export { DatabaseService };
+// ensureCategoriesInitialized is already exported as a named export on line 593
 export const CategoryService = databaseService;
-
 export const TransactionService = databaseService;
+export const getDatabaseInstance = () => databaseService.db;
