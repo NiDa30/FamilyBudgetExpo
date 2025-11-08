@@ -7,6 +7,7 @@ import {
   useRoute,
 } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
+import { collection, onSnapshot, query, where } from "firebase/firestore";
 import { useCallback, useEffect, useState } from "react"; // Đã có
 import {
   ActivityIndicator,
@@ -22,11 +23,12 @@ import {
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { Category, RootStackParamList } from "../App";
+import { COLLECTIONS } from "./constants/collections";
 import {
   CategoryService,
   TransactionService,
 } from "./database/databaseService";
-import { authInstance as auth } from "./firebaseConfig"; // Đã có
+import { authInstance as auth, db } from "./firebaseConfig"; // Đã có
 import SyncEngine from "./service/sync/SyncEngine";
 
 type NhapGiaoDichNavigationProp = NativeStackNavigationProp<
@@ -76,18 +78,55 @@ const NhapGiaoDich = () => {
     return () => unsubscribe();
   }, []);
 
-  // ✅ HÀM MỚI: Tách riêng logic load từ SQLite
+  // ✅ HÀM MỚI: Tách riêng logic load từ SQLite (bao gồm default và user categories)
   const loadCategoriesFromSQLite = async (currentUserId: string) => {
     try {
+      // ✅ BƯỚC 1: ĐẢM BẢO CATEGORIES ĐÃ ĐƯỢC KHỞI TẠO (bao gồm default categories)
+      try {
+        const { ensureCategoriesInitialized } = await import(
+          "./database/databaseService"
+        );
+        await ensureCategoriesInitialized(currentUserId);
+      } catch (initError) {
+        console.warn("Failed to ensure categories initialized:", initError);
+      }
+
+      // ✅ BƯỚC 2: LOAD TẤT CẢ CATEGORIES TỪ SQLite (default + user categories)
       const allCategories = await CategoryService.getCategoriesByUser(
         currentUserId
       );
-      const expense = allCategories.filter(
-        (cat: any) => cat.type === "EXPENSE"
-      );
-      const income = allCategories.filter((cat: any) => cat.type === "INCOME");
+
+      // ✅ BƯỚC 3: FILTER deleted_at IS NULL VÀ is_hidden = 0
+      const expense = allCategories
+        .filter(
+          (cat: any) =>
+            (cat.type === "EXPENSE" || !cat.type) &&
+            !cat.deleted_at &&
+            !cat.is_hidden
+        )
+        .map((cat: any) => ({
+          id: cat.id,
+          name: cat.name,
+          icon: cat.icon || "tag",
+          color: cat.color || "#2196F3",
+          count: 0, // Required by Category type
+        }));
+
+      const income = allCategories
+        .filter(
+          (cat: any) =>
+            cat.type === "INCOME" && !cat.deleted_at && !cat.is_hidden
+        )
+        .map((cat: any) => ({
+          id: cat.id,
+          name: cat.name,
+          icon: cat.icon || "tag",
+          color: cat.color || "#2196F3",
+          count: 0, // Required by Category type
+        }));
+
       console.log(
-        `💾 Loaded ${expense.length} expense & ${income.length} income from SQLite`
+        `💾 Loaded ${expense.length} expense & ${income.length} income from SQLite (including default categories)`
       );
       return { expense, income };
     } catch (error) {
@@ -96,6 +135,47 @@ const NhapGiaoDich = () => {
     }
   };
 
+  // ✅ HELPER FUNCTION: Sync categories from Firebase to SQLite và update UI
+  const handleCategorySyncFromFirebase = useCallback(
+    async (currentUserId: string, isActiveFlag: boolean) => {
+      try {
+        console.log("🔄 Syncing categories from Firebase to SQLite...");
+
+        // Sync Firebase → SQLite
+        await SyncEngine.pullRemoteChanges(currentUserId);
+
+        // Reload từ SQLite sau khi sync
+        const syncedData = await loadCategoriesFromSQLite(currentUserId);
+
+        if (isActiveFlag) {
+          setExpenseCategories(syncedData.expense);
+          setIncomeCategories(syncedData.income);
+
+          // Cập nhật selectedCategory nếu nó không còn tồn tại
+          setSelectedCategory((currentSelected) => {
+            if (currentSelected) {
+              const allCats = [...syncedData.expense, ...syncedData.income];
+              const categoryExists = allCats.some(
+                (c) => c.id === currentSelected.id
+              );
+              if (!categoryExists) {
+                return activeTab === "expense"
+                  ? syncedData.expense[0] || null
+                  : syncedData.income[0] || null;
+              }
+            }
+            return currentSelected;
+          });
+
+          console.log("🔃 UI updated with synced category data from Firebase");
+        }
+      } catch (error) {
+        console.warn("Failed to sync categories from Firebase:", error);
+      }
+    },
+    [activeTab]
+  );
+
   // ✅ CẬP NHẬT: useFocusEffect với logic "Load -> Sync -> Reload"
   useFocusEffect(
     useCallback(() => {
@@ -103,87 +183,101 @@ const NhapGiaoDich = () => {
 
       let isActive = true; // Cờ để tránh cập nhật state nếu component đã unmount
 
-      const initializeCategories = async () => {
-        console.log("Screen focused: Initializing categories...");
-        setIsLoadingCategories(true);
+      console.log("Screen focused: Initializing categories...");
+      setIsLoadingCategories(true);
 
-        // BƯỚC 1: Load từ SQLite (Nhanh)
-        const localData = await loadCategoriesFromSQLite(userId);
+      // ✅ BƯỚC 1: Load từ SQLite (Nhanh) - Bao gồm default và user categories
+      loadCategoriesFromSQLite(userId).then((localData) => {
         if (isActive) {
           setExpenseCategories(localData.expense);
           setIncomeCategories(localData.income);
 
           // Cập nhật selectedCategory nếu nó không còn tồn tại
-          if (selectedCategory) {
-            const allCats = [...localData.expense, ...localData.income];
-            const categoryExists = allCats.some(
-              (c) => c.id === selectedCategory.id
-            );
-            if (!categoryExists) {
-              setSelectedCategory(
-                activeTab === "expense"
-                  ? localData.expense[0]
-                  : localData.income[0]
+          setSelectedCategory((currentSelected) => {
+            if (currentSelected) {
+              const allCats = [...localData.expense, ...localData.income];
+              const categoryExists = allCats.some(
+                (c) => c.id === currentSelected.id
               );
+              if (!categoryExists) {
+                return activeTab === "expense"
+                  ? localData.expense[0] || null
+                  : localData.income[0] || null;
+              }
+            } else if (!initialCategory) {
+              // Nếu chưa chọn, gán mặc định
+              return activeTab === "expense"
+                ? localData.expense[0] || null
+                : localData.income[0] || null;
             }
+            return currentSelected;
+          });
+
+          setIsLoadingCategories(false);
+        }
+      });
+
+      // ✅ BƯỚC 2: SETUP FIREBASE REALTIME LISTENER (để đồng bộ với các màn hình khác)
+      const categoriesQuery = query(
+        collection(db, COLLECTIONS.CATEGORIES),
+        where("userID", "==", userId),
+        where("isHidden", "==", false)
+      );
+
+      // Debounce timer để tránh sync quá nhiều lần
+      let categorySyncTimeout: ReturnType<typeof setTimeout> | null = null;
+      let lastCategorySyncTime = 0;
+      const CATEGORY_SYNC_DEBOUNCE_MS = 2000; // 2 seconds debounce
+
+      const unsubscribeCategories = onSnapshot(
+        categoriesQuery,
+        async (snapshot) => {
+          // Check if there are actual changes
+          const changes = snapshot.docChanges();
+          if (changes.length === 0) {
+            return; // No changes, skip sync
           }
-          // Nếu chưa chọn, gán mặc định
-          else if (!initialCategory) {
-            setSelectedCategory(
-              activeTab === "expense"
-                ? localData.expense[0]
-                : localData.income[0]
-            );
+
+          const now = Date.now();
+          // Debounce: skip if synced too recently
+          if (now - lastCategorySyncTime < CATEGORY_SYNC_DEBOUNCE_MS) {
+            // Clear existing timeout and set a new one
+            if (categorySyncTimeout) {
+              clearTimeout(categorySyncTimeout);
+            }
+            categorySyncTimeout = setTimeout(async () => {
+              await handleCategorySyncFromFirebase(userId, isActive);
+              lastCategorySyncTime = Date.now();
+            }, CATEGORY_SYNC_DEBOUNCE_MS);
+            return;
+          }
+
+          lastCategorySyncTime = now;
+          await handleCategorySyncFromFirebase(userId, isActive);
+        },
+        (error) => {
+          console.error("Firebase categories listener error:", error);
+          if (isActive) {
+            setIsLoadingCategories(false);
           }
         }
+      );
 
-        // BƯỚC 2: Sync ở Background (Chậm)
-        try {
-          console.log("🔄 Background category sync started...");
-          await SyncEngine.performSync(userId); // Chạy full sync
+      // ✅ BƯỚC 3: Background sync (chỉ push local changes lên Firebase)
+      // Không cần full sync vì đã có realtime listener
+      SyncEngine.pushLocalChanges(userId).catch((syncError) => {
+        console.warn("Failed to push local changes:", syncError);
+      });
 
-          // BƯỚC 3: Reload từ SQLite sau khi sync
-          const syncedData = await loadCategoriesFromSQLite(userId);
-
-          if (isActive) {
-            // ✅ SỬA LỖI LOG: Chỉ log khi thật sự cập nhật
-            let didUpdate = false;
-            if (
-              JSON.stringify(syncedData.expense) !==
-              JSON.stringify(localData.expense)
-            ) {
-              setExpenseCategories(syncedData.expense);
-              didUpdate = true;
-            }
-            if (
-              JSON.stringify(syncedData.income) !==
-              JSON.stringify(localData.income)
-            ) {
-              setIncomeCategories(syncedData.income);
-              didUpdate = true;
-            }
-
-            if (didUpdate) {
-              console.log("🔃 UI updated with synced category data");
-            } else {
-              console.log("✓ No category changes from Firebase");
-            }
-          }
-        } catch (syncError) {
-          console.warn("Background category sync failed:", syncError);
-        } finally {
-          if (isActive) {
-            setIsLoadingCategories(false); // Ẩn loading
-          }
-        }
-      };
-
-      initializeCategories();
-
+      // Return cleanup function
       return () => {
-        isActive = false; // Cleanup
+        isActive = false;
+        if (categorySyncTimeout) {
+          clearTimeout(categorySyncTimeout);
+        }
+        unsubscribeCategories();
       };
-    }, [userId]) // Chỉ chạy lại nếu userId thay đổi
+    }, [userId, handleCategorySyncFromFirebase]) // Chỉ chạy lại khi userId hoặc handleCategorySyncFromFirebase thay đổi
   );
 
   // ... (Tất cả các hàm khác: formatDate, formatTime, handleNumberPress, handleSave, v.v.
@@ -626,8 +720,8 @@ const NhapGiaoDich = () => {
           <TouchableOpacity activeOpacity={1} style={styles.modalContent}>
             <View style={styles.modalHandle} />
 
+            {/* ✅ CẬP NHẬT: Tab để chuyển đổi giữa Chi tiêu và Thu nhập với số lượng danh mục */}
             <View style={styles.modalHeader}>
-              {/* Đây là phần code bạn dán, nó giữ nguyên */}
               <TouchableOpacity
                 style={[
                   styles.modalTab,
@@ -651,6 +745,11 @@ const NhapGiaoDich = () => {
                 >
                   Chi tiêu
                 </Text>
+                <View style={styles.categoryCountBadge}>
+                  <Text style={styles.categoryCountText}>
+                    {expenseCategories.length}
+                  </Text>
+                </View>
               </TouchableOpacity>
 
               <View style={styles.modalDivider} />
@@ -678,6 +777,11 @@ const NhapGiaoDich = () => {
                 >
                   Thu nhập
                 </Text>
+                <View style={styles.categoryCountBadge}>
+                  <Text style={styles.categoryCountText}>
+                    {incomeCategories.length}
+                  </Text>
+                </View>
               </TouchableOpacity>
             </View>
 
@@ -695,6 +799,14 @@ const NhapGiaoDich = () => {
                 keyExtractor={(item) => item.id}
                 numColumns={4}
                 contentContainerStyle={styles.categoryGrid}
+                ListEmptyComponent={
+                  <View style={styles.emptyCategoryContainer}>
+                    <Text style={styles.emptyCategoryText}>
+                      Chưa có danh mục{" "}
+                      {activeTab === "expense" ? "chi tiêu" : "thu nhập"}
+                    </Text>
+                  </View>
+                }
               />
             )}
           </TouchableOpacity>
@@ -954,7 +1066,33 @@ const styles = StyleSheet.create({
     backgroundColor: "#E0E0E0",
     marginHorizontal: 8,
   },
+  categoryCountBadge: {
+    backgroundColor: "rgba(0, 0, 0, 0.1)",
+    borderRadius: 10,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    marginLeft: 4,
+    minWidth: 20,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  categoryCountText: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#666",
+  },
   categoryGrid: { padding: 16 },
+  emptyCategoryContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingVertical: 60,
+  },
+  emptyCategoryText: {
+    fontSize: 14,
+    color: "#9E9E9E",
+    textAlign: "center",
+  },
   categoryItem: {
     flex: 1,
     aspectRatio: 1,

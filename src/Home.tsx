@@ -1,8 +1,12 @@
 // src/Home.tsx
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import { RouteProp, useNavigation, useRoute } from "@react-navigation/native";
+import {
+  RouteProp,
+  useFocusEffect,
+  useNavigation,
+  useRoute,
+} from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   Alert,
   FlatList,
@@ -15,8 +19,11 @@ import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { Category, RootStackParamList } from "../App";
 
 // ĐÃ THÊM: DÙNG MÀU THEME
+import { collection, onSnapshot, query, where } from "firebase/firestore";
+import { COLLECTIONS } from "./constants/collections";
 import { useTheme } from "./context/ThemeContext";
-import { authInstance as auth } from "./firebaseConfig";
+import { authInstance as auth, dbInstance as db } from "./firebaseConfig";
+import CategorySyncService from "./services/categorySyncService";
 
 type HomeScreenNavigationProp = NativeStackNavigationProp<
   RootStackParamList,
@@ -46,62 +53,6 @@ interface Transaction {
   category_color?: string;
 }
 
-const DEFAULT_EXPENSE_CATEGORIES: Category[] = [
-  { id: "1", name: "Ăn uống", icon: "food-apple", color: "#FF6347", count: 29 },
-  { id: "2", name: "Quần áo", icon: "tshirt-crew", color: "#32CD32", count: 5 },
-  {
-    id: "3",
-    name: "Hoa quả",
-    icon: "fruit-cherries",
-    color: "#00CED1",
-    count: 3,
-  },
-  { id: "4", name: "Mua sắm", icon: "shopping", color: "#FF69B4", count: 4 },
-  { id: "5", name: "Giao thông", icon: "bus", color: "#ADFF2F", count: 2 },
-  { id: "6", name: "Nhà ở", icon: "home", color: "#FFA500", count: 6 },
-  { id: "7", name: "Du lịch", icon: "airplane", color: "#20B2AA", count: 1 },
-  {
-    id: "8",
-    name: "Rượu và đồ uống",
-    icon: "glass-wine",
-    color: "#BA55D3",
-    count: 2,
-  },
-  {
-    id: "9",
-    name: "Chi phí điện nước",
-    icon: "water",
-    color: "#4682B4",
-    count: 3,
-  },
-  { id: "10", name: "Quà", icon: "gift", color: "#FF4500", count: 2 },
-  { id: "11", name: "Giáo dục", icon: "school", color: "#FFD700", count: 1 },
-];
-
-const DEFAULT_INCOME_CATEGORIES: Category[] = [
-  {
-    id: "i1",
-    name: "Lương",
-    icon: "cash-multiple",
-    color: "#4CAF50",
-    count: 12,
-  },
-  { id: "i2", name: "Thưởng", icon: "gift", color: "#FF9800", count: 3 },
-  { id: "i3", name: "Đầu tư", icon: "chart-line", color: "#2196F3", count: 5 },
-  { id: "i4", name: "Kinh doanh", icon: "store", color: "#9C27B0", count: 8 },
-  { id: "i5", name: "Freelance", icon: "laptop", color: "#00BCD4", count: 6 },
-  { id: "i6", name: "Cho thuê", icon: "home-city", color: "#795548", count: 4 },
-  { id: "i7", name: "Lãi suất", icon: "percent", color: "#607D8B", count: 2 },
-  { id: "i8", name: "Bán hàng", icon: "sale", color: "#E91E63", count: 7 },
-  {
-    id: "i9",
-    name: "Khác",
-    icon: "dots-horizontal",
-    color: "#9E9E9E",
-    count: 1,
-  },
-];
-
 const Home: React.FC = () => {
   const navigation = useNavigation<HomeScreenNavigationProp>();
   const route = useRoute<HomeRouteProp>();
@@ -110,12 +61,9 @@ const Home: React.FC = () => {
   const { themeColor } = useTheme();
 
   const [activeTab, setActiveTab] = useState<"expense" | "income">("expense");
-  const [expenseCategories, setExpenseCategories] = useState<Category[]>(
-    DEFAULT_EXPENSE_CATEGORIES
-  );
-  const [incomeCategories, setIncomeCategories] = useState<Category[]>(
-    DEFAULT_INCOME_CATEGORIES
-  );
+  const [expenseCategories, setExpenseCategories] = useState<Category[]>([]);
+  const [incomeCategories, setIncomeCategories] = useState<Category[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
 
   const currentCategories =
     activeTab === "expense" ? expenseCategories : incomeCategories;
@@ -123,29 +71,163 @@ const Home: React.FC = () => {
   useEffect(() => {
     const loadCategories = async () => {
       try {
+        setIsLoading(true);
         const user = auth.currentUser;
-        if (!user?.uid) return;
+        if (!user?.uid) {
+          setIsLoading(false);
+          return;
+        }
 
-        // Load from SQLite first
+        // ✅ BƯỚC 1: ĐẢM BẢO CATEGORIES ĐÃ ĐƯỢC KHỞI TẠO
         try {
-          const DatabaseService = (await import("./database/databaseService"))
-            .default;
-          const allCategories = await DatabaseService.getCategoriesByUser(
-            user.uid
+          const { ensureCategoriesInitialized } = await import(
+            "./database/databaseService"
+          );
+          await ensureCategoriesInitialized(user.uid);
+        } catch (initError) {
+          console.warn("Failed to ensure categories initialized:", initError);
+        }
+
+        // ✅ BƯỚC 2: LOAD TỪ SQLite (Bao gồm cả default và user categories)
+        const DatabaseService = (await import("./database/databaseService"))
+          .default;
+        const allCategories = await DatabaseService.getCategoriesByUser(
+          user.uid
+        );
+
+        // ✅ BƯỚC 3: PHÂN LOẠI THEO TYPE VÀ FILTER deleted_at IS NULL
+        const expenseCats = allCategories
+          .filter(
+            (cat: any) =>
+              (cat.type === "EXPENSE" || !cat.type) &&
+              !cat.deleted_at &&
+              !cat.is_hidden
+          )
+          .map((cat: any) => ({
+            id: cat.id,
+            name: cat.name,
+            icon: cat.icon || "tag",
+            color: cat.color || "#2196F3",
+            count: 0, // Count will be calculated separately if needed
+          }));
+
+        const incomeCats = allCategories
+          .filter(
+            (cat: any) =>
+              cat.type === "INCOME" && !cat.deleted_at && !cat.is_hidden
+          )
+          .map((cat: any) => ({
+            id: cat.id,
+            name: cat.name,
+            icon: cat.icon || "tag",
+            color: cat.color || "#2196F3",
+            count: 0,
+          }));
+
+        setExpenseCategories(expenseCats);
+        setIncomeCategories(incomeCats);
+
+        console.log(
+          `✅ Loaded ${expenseCats.length} expense and ${incomeCats.length} income categories from SQLite`
+        );
+      } catch (error) {
+        console.error("Error loading categories:", error);
+        // Set empty arrays on error
+        setExpenseCategories([]);
+        setIncomeCategories([]);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    loadCategories();
+  }, []);
+
+  // ✅ REAL-TIME SYNC: Setup Firebase listeners for categories
+  useFocusEffect(
+    useCallback(() => {
+      const user = auth.currentUser;
+      if (!user?.uid) return;
+
+      console.log("🔄 Home screen focused, setting up real-time listeners...");
+      let isActive = true;
+
+      // Setup Firebase real-time listener for categories
+      const categoriesQuery = query(
+        collection(db, COLLECTIONS.CATEGORIES),
+        where("userID", "==", user.uid),
+        where("isHidden", "==", false)
+      );
+
+      // Debounce timer để tránh sync quá nhiều lần
+      let categorySyncTimeout: ReturnType<typeof setTimeout> | null = null;
+      let lastCategorySyncTime = 0;
+      const CATEGORY_SYNC_DEBOUNCE_MS = 2000; // 2 seconds debounce
+
+      const unsubscribeCategories = onSnapshot(
+        categoriesQuery,
+        async (snapshot) => {
+          if (!isActive) return;
+
+          // Check if there are actual changes
+          const changes = snapshot.docChanges();
+          if (changes.length === 0) {
+            return; // No changes, skip sync
+          }
+
+          console.log(
+            `📋 Firebase categories updated in Home: ${changes.length} changes detected`
           );
 
-          const expenseCats = allCategories
-            .filter((cat: any) => cat.type === "EXPENSE" || !cat.type)
-            .map((cat: any) => ({
-              id: cat.id,
-              name: cat.name,
-              icon: cat.icon || "tag",
-              color: cat.color || "#2196F3",
-              count: 0, // Count will be calculated separately if needed
-            }));
+          const now = Date.now();
+          // Debounce: skip if synced too recently
+          if (now - lastCategorySyncTime < CATEGORY_SYNC_DEBOUNCE_MS) {
+            // Clear existing timeout and set a new one
+            if (categorySyncTimeout) {
+              clearTimeout(categorySyncTimeout);
+            }
+            categorySyncTimeout = setTimeout(async () => {
+              if (isActive) {
+                await syncCategoriesFromFirebase(user.uid);
+                lastCategorySyncTime = Date.now();
+              }
+            }, CATEGORY_SYNC_DEBOUNCE_MS);
+            return;
+          }
 
-          const incomeCats = allCategories
-            .filter((cat: any) => cat.type === "INCOME")
+          lastCategorySyncTime = now;
+          await syncCategoriesFromFirebase(user.uid);
+        },
+        (error) => {
+          console.error(
+            "❌ Firebase categories listener error in Home:",
+            error
+          );
+        }
+      );
+
+      // Helper function to sync categories from Firebase to SQLite
+      const syncCategoriesFromFirebase = async (uid: string) => {
+        try {
+          console.log(
+            "🔄 Syncing categories from Firebase to SQLite in Home..."
+          );
+          const syncResult = await CategorySyncService.syncFromFirebase(uid);
+          console.log(
+            `✅ Synced ${syncResult.synced} categories from Firebase to SQLite`
+          );
+
+          // Reload categories from SQLite
+          const DatabaseService = (await import("./database/databaseService"))
+            .default;
+          const allCategories = await DatabaseService.getCategoriesByUser(uid);
+
+          const expenseCats = allCategories
+            .filter(
+              (cat: any) =>
+                (cat.type === "EXPENSE" || !cat.type) &&
+                !cat.deleted_at &&
+                !cat.is_hidden
+            )
             .map((cat: any) => ({
               id: cat.id,
               name: cat.name,
@@ -154,110 +236,52 @@ const Home: React.FC = () => {
               count: 0,
             }));
 
-          // If no expense categories, use defaults
-          if (expenseCats.length > 0) {
+          const incomeCats = allCategories
+            .filter(
+              (cat: any) =>
+                cat.type === "INCOME" && !cat.deleted_at && !cat.is_hidden
+            )
+            .map((cat: any) => ({
+              id: cat.id,
+              name: cat.name,
+              icon: cat.icon || "tag",
+              color: cat.color || "#2196F3",
+              count: 0,
+            }));
+
+          if (isActive) {
             setExpenseCategories(expenseCats);
-            await AsyncStorage.setItem(
-              "expenseCategories",
-              JSON.stringify(expenseCats)
-            );
-          } else {
-            setExpenseCategories(DEFAULT_EXPENSE_CATEGORIES);
-            await AsyncStorage.setItem(
-              "expenseCategories",
-              JSON.stringify(DEFAULT_EXPENSE_CATEGORIES)
-            );
-          }
-
-          // If no income categories, use defaults
-          if (incomeCats.length > 0) {
             setIncomeCategories(incomeCats);
-            await AsyncStorage.setItem(
-              "incomeCategories",
-              JSON.stringify(incomeCats)
-            );
-          } else {
-            setIncomeCategories(DEFAULT_INCOME_CATEGORIES);
-            await AsyncStorage.setItem(
-              "incomeCategories",
-              JSON.stringify(DEFAULT_INCOME_CATEGORIES)
+            console.log(
+              `✅ Updated UI with ${expenseCats.length} expense and ${incomeCats.length} income categories`
             );
           }
-        } catch (sqliteError) {
-          console.warn(
-            "Failed to load from SQLite, using AsyncStorage:",
-            sqliteError
-          );
-
-          // Fallback to AsyncStorage
-          const storedExpense = await AsyncStorage.getItem("expenseCategories");
-          const storedIncome = await AsyncStorage.getItem("incomeCategories");
-
-          if (storedExpense) {
-            const parsedExpense = JSON.parse(storedExpense);
-            if (Array.isArray(parsedExpense) && parsedExpense.length > 0) {
-              setExpenseCategories(parsedExpense);
-            } else {
-              setExpenseCategories(DEFAULT_EXPENSE_CATEGORIES);
-              await AsyncStorage.setItem(
-                "expenseCategories",
-                JSON.stringify(DEFAULT_EXPENSE_CATEGORIES)
-              );
-            }
-          } else {
-            setExpenseCategories(DEFAULT_EXPENSE_CATEGORIES);
-            await AsyncStorage.setItem(
-              "expenseCategories",
-              JSON.stringify(DEFAULT_EXPENSE_CATEGORIES)
-            );
-          }
-
-          if (storedIncome) {
-            const parsedIncome = JSON.parse(storedIncome);
-            if (Array.isArray(parsedIncome) && parsedIncome.length > 0) {
-              setIncomeCategories(parsedIncome);
-            } else {
-              setIncomeCategories(DEFAULT_INCOME_CATEGORIES);
-              await AsyncStorage.setItem(
-                "incomeCategories",
-                JSON.stringify(DEFAULT_INCOME_CATEGORIES)
-              );
-            }
-          } else {
-            setIncomeCategories(DEFAULT_INCOME_CATEGORIES);
-            await AsyncStorage.setItem(
-              "incomeCategories",
-              JSON.stringify(DEFAULT_INCOME_CATEGORIES)
-            );
-          }
+        } catch (error) {
+          console.error("❌ Error syncing categories from Firebase:", error);
         }
-      } catch (error) {
-        console.error("Error loading categories:", error);
-      }
-    };
-    loadCategories();
-  }, []);
+      };
 
-  useEffect(() => {
-    if (route.params?.updatedCategories) {
-      const updatedCategories = route.params.updatedCategories;
-      if (Array.isArray(updatedCategories)) {
-        if (activeTab === "expense") {
-          setExpenseCategories(updatedCategories);
-          AsyncStorage.setItem(
-            "expenseCategories",
-            JSON.stringify(updatedCategories)
-          );
-        } else {
-          setIncomeCategories(updatedCategories);
-          AsyncStorage.setItem(
-            "incomeCategories",
-            JSON.stringify(updatedCategories)
-          );
+      // Initial load
+      syncCategoriesFromFirebase(user.uid);
+
+      // Return cleanup function
+      return () => {
+        isActive = false;
+        if (categorySyncTimeout) {
+          clearTimeout(categorySyncTimeout);
         }
-      }
-    }
-  }, [route.params?.updatedCategories, activeTab]);
+        unsubscribeCategories();
+        console.log("🔄 Home screen unfocused, cleaned up listeners");
+      };
+    }, [])
+  );
+
+  // ✅ HÀM MỚI: Xử lý thêm category
+  const handleAddCategory = () => {
+    // ✅ Chuyển đến màn hình thêm category
+    // Nhappl.tsx sẽ tự động xử lý budget group dựa trên route params nếu có
+    navigation.navigate("Nhappl" as any);
+  };
 
   const handleDeleteCategory = async (id: string) => {
     Alert.alert("Xóa phân loại", "Bạn có chắc muốn xóa phân loại này?", [
@@ -273,45 +297,36 @@ const Home: React.FC = () => {
               return;
             }
 
-            // Update local state
+            // ✅ BƯỚC 1: XÓA TRONG SQLite (soft delete với is_synced = 0)
+            const DatabaseService = (await import("./database/databaseService"))
+              .default;
+            await DatabaseService.deleteCategory(id);
+
+            // ✅ BƯỚC 2: CẬP NHẬT UI
             if (activeTab === "expense") {
-              const updatedCategories = expenseCategories.filter(
-                (cat) => cat.id !== id
-              );
-              setExpenseCategories(updatedCategories);
-              await AsyncStorage.setItem(
-                "expenseCategories",
-                JSON.stringify(updatedCategories)
+              setExpenseCategories((prev) =>
+                prev.filter((cat) => cat.id !== id)
               );
             } else {
-              const updatedCategories = incomeCategories.filter(
-                (cat) => cat.id !== id
-              );
-              setIncomeCategories(updatedCategories);
-              await AsyncStorage.setItem(
-                "incomeCategories",
-                JSON.stringify(updatedCategories)
+              setIncomeCategories((prev) =>
+                prev.filter((cat) => cat.id !== id)
               );
             }
 
-            // Delete from SQLite and sync to Firebase
+            // ✅ BƯỚC 3: ĐỒNG BỘ LÊN FIREBASE
+            // deleteCategory đã set is_synced = 0, nên SyncEngine sẽ tự động đồng bộ
+            // Tuy nhiên, để đảm bảo đồng bộ nhanh, schedule sync ngay
             try {
-              const DatabaseService = (
-                await import("./database/databaseService")
-              ).default;
-              await DatabaseService.deleteCategory(id);
-
-              // Sync to Firebase
-              const FirebaseService = (
-                await import("./service/firebase/FirebaseService")
-              ).default;
-              await FirebaseService.deleteCategory(id);
-
-              console.log(`✅ Deleted category ${id} from SQLite and Firebase`);
+              const SyncEngine = (await import("./service/sync/SyncEngine"))
+                .default;
+              SyncEngine.scheduleSync(user.uid, 1000); // Sync sau 1 giây
+              console.log(`⏰ Scheduled sync for deleted category ${id}`);
             } catch (syncError) {
-              console.warn("Failed to sync category deletion:", syncError);
-              // Category is still deleted locally, sync will retry later
+              console.warn("Failed to schedule sync:", syncError);
+              // SyncEngine sẽ tự động retry sau
             }
+
+            console.log(`✅ Deleted category ${id} from SQLite`);
           } catch (error) {
             console.error("Error deleting category:", error);
             Alert.alert("Lỗi", "Không thể xóa phân loại");
@@ -422,7 +437,7 @@ const Home: React.FC = () => {
                     activeTab === "expense" && styles.countTextActive,
                   ]}
                 >
-                  {expenseCategories.reduce((sum, cat) => sum + cat.count, 0)}
+                  {expenseCategories.length}
                 </Text>
               </View>
             </View>
@@ -467,7 +482,7 @@ const Home: React.FC = () => {
                     activeTab === "income" && styles.countTextActive,
                   ]}
                 >
-                  {incomeCategories.reduce((sum, cat) => sum + cat.count, 0)}
+                  {incomeCategories.length}
                 </Text>
               </View>
             </View>
@@ -479,19 +494,35 @@ const Home: React.FC = () => {
       <View style={[styles.infoBanner, { backgroundColor: `${themeColor}15` }]}>
         <Icon name="information-outline" size={18} color={themeColor} />
         <Text style={[styles.infoText, { color: themeColor }]}>
-          Kéo để sắp xếp lại thứ tự phân loại
+          Phân loại hiện có -{" "}
+          {activeTab === "expense" ? "Chi tiêu" : "Thu nhập"} (
+          {currentCategories.length})
         </Text>
       </View>
 
       {/* List categories */}
-      <FlatList
-        data={currentCategories}
-        renderItem={renderCategoryItem}
-        keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.listContent}
-        showsVerticalScrollIndicator={false}
-        key={activeTab}
-      />
+      {isLoading ? (
+        <View style={styles.loadingContainer}>
+          <Text style={styles.loadingText}>Đang tải danh mục...</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={currentCategories}
+          renderItem={renderCategoryItem}
+          keyExtractor={(item) => item.id}
+          contentContainerStyle={styles.listContent}
+          showsVerticalScrollIndicator={false}
+          key={activeTab}
+          ListEmptyComponent={
+            <View style={styles.emptyContainer}>
+              <Icon name="folder-outline" size={64} color="#BDBDBD" />
+              <Text style={styles.emptyText}>
+                Chưa có phân loại nào. Hãy thêm phân loại mới!
+              </Text>
+            </View>
+          }
+        />
+      )}
 
       {/* Nút thêm phân loại mới - Floating – DÙNG MÀU THEME */}
       <TouchableOpacity
@@ -499,7 +530,7 @@ const Home: React.FC = () => {
           styles.addButtonFloating,
           { backgroundColor: themeColor, shadowColor: themeColor },
         ]}
-        onPress={() => navigation.navigate("Nhappl")}
+        onPress={handleAddCategory}
         activeOpacity={0.9}
       >
         <Icon name="plus" size={28} color="#fff" />
@@ -509,7 +540,7 @@ const Home: React.FC = () => {
       <View style={styles.bottomContainer}>
         <TouchableOpacity
           style={[styles.addButton, { backgroundColor: `${themeColor}15` }]}
-          onPress={() => navigation.navigate("Nhappl")}
+          onPress={handleAddCategory}
           activeOpacity={0.8}
         >
           <Icon name="plus-circle-outline" size={22} color={themeColor} />
@@ -737,6 +768,30 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.3,
     shadowRadius: 8,
     elevation: 8,
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingTop: 100,
+  },
+  loadingText: {
+    fontSize: 16,
+    color: "#757575",
+    marginTop: 16,
+  },
+  emptyContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingTop: 100,
+    paddingHorizontal: 32,
+  },
+  emptyText: {
+    fontSize: 16,
+    color: "#757575",
+    marginTop: 16,
+    textAlign: "center",
   },
 });
 

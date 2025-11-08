@@ -1,12 +1,5 @@
-import { useFocusEffect, useNavigation } from "@react-navigation/native";
+import { useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import {
-  collection,
-  onSnapshot,
-  orderBy,
-  query,
-  where,
-} from "firebase/firestore";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -21,9 +14,12 @@ import {
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { RootStackParamList } from "../App";
-import { TransactionRepository } from "./database/repositories";
-import { Transaction } from "./domain/types";
-import { auth, db } from "./firebaseConfig";
+import {
+  CategoryRepository,
+  TransactionRepository,
+} from "./database/repositories";
+import { Category, Transaction } from "./domain/types";
+import { auth } from "./firebaseConfig";
 
 type SearchScreenNavigationProp = NativeStackNavigationProp<
   RootStackParamList,
@@ -34,6 +30,7 @@ const Timkiem = () => {
   const navigation = useNavigation<SearchScreenNavigationProp>();
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<Transaction[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -47,11 +44,21 @@ const Timkiem = () => {
     "all" | "day" | "week" | "month" | "year"
   >("all");
 
-  // Get current user ID
+  // Get current user ID and load categories
   useEffect(() => {
     const currentUser = auth.currentUser;
     if (currentUser) {
       setUserId(currentUser.uid);
+      // Load categories for category info display
+      const loadCategories = async () => {
+        try {
+          const cats = await CategoryRepository.listByUser(currentUser.uid);
+          setCategories(cats);
+        } catch (error) {
+          console.warn("Failed to load categories:", error);
+        }
+      };
+      loadCategories();
     } else {
       // Handle case when user is not authenticated
       Alert.alert("Lỗi", "Vui lòng đăng nhập để sử dụng tính năng tìm kiếm");
@@ -78,6 +85,8 @@ const Timkiem = () => {
     start: string;
     end: string;
   } | null => {
+    if (filterTime === "all") return null;
+
     const now = new Date();
     let startDate: Date;
     let endDate: Date = new Date(now);
@@ -121,6 +130,12 @@ const Timkiem = () => {
     async (query: string) => {
       if (!userId) return;
 
+      // Only perform search if there's a query or filters are applied
+      if (!query.trim() && filterType === "all" && filterTime === "all") {
+        setSearchResults([]);
+        return;
+      }
+
       setIsLoading(true);
       try {
         const filters: any = {};
@@ -136,14 +151,12 @@ const Timkiem = () => {
         }
 
         // Add date range filter
-        if (filterTime !== "all") {
-          const dateRange = getDateRange();
-          if (dateRange) {
-            filters.range = {
-              start: dateRange.start,
-              end: dateRange.end,
-            };
-          }
+        const dateRange = getDateRange();
+        if (dateRange) {
+          filters.range = {
+            start: dateRange.start,
+            end: dateRange.end,
+          };
         }
 
         // Use TransactionRepository.query for efficient search
@@ -186,91 +199,26 @@ const Timkiem = () => {
     };
   }, [searchQuery, filterType, filterTime, userId, performSearch]);
 
-  // ✅ REAL-TIME SYNC: Set up Firebase listeners for data synchronization
-  useFocusEffect(
-    useCallback(() => {
-      const user = auth.currentUser;
-      if (!user?.uid) return;
-
-      console.log(
-        "🔄 Timkiem screen focused, setting up real-time listeners..."
-      );
-
-      // Set up transaction listener
-      const transactionsQuery = query(
-        collection(db, "TRANSACTIONS"),
-        where("userID", "==", user.uid),
-        where("isDeleted", "==", false),
-        orderBy("date", "desc")
-      );
-
-      const unsubscribeTransactions = onSnapshot(
-        transactionsQuery,
-        async (snapshot) => {
-          console.log(
-            `📊 Firebase transactions updated: ${snapshot.docs.length} transactions`
-          );
-
-          // Sync Firebase transactions to SQLite
-          try {
-            for (const doc of snapshot.docs) {
-              const data = doc.data();
-              try {
-                const existing = await TransactionRepository.getById(doc.id);
-                if (!existing) {
-                  await TransactionRepository.create({
-                    id: doc.id,
-                    userId: data.userID || user.uid,
-                    categoryId: data.categoryID || null,
-                    amount: data.amount || 0,
-                    type: data.type || "EXPENSE",
-                    date: data.date?.toMillis
-                      ? new Date(data.date.toMillis()).toISOString()
-                      : data.date || new Date().toISOString(),
-                    description: data.description || null,
-                    paymentMethod: data.paymentMethod || null,
-                    merchantName: data.merchantName || null,
-                    merchantLocation: data.merchantLocation || null,
-                    latitude: data.latitude || null,
-                    longitude: data.longitude || null,
-                    tags: data.tags ? data.tags.split(",") : undefined,
-                    isSynced: true,
-                    lastModifiedAt: data.updatedAt?.toMillis
-                      ? new Date(data.updatedAt.toMillis()).toISOString()
-                      : new Date().toISOString(),
-                    isDeleted: false,
-                    createdAt: data.createdAt?.toMillis
-                      ? new Date(data.createdAt.toMillis()).toISOString()
-                      : new Date().toISOString(),
-                  });
-                }
-              } catch (syncError) {
-                // Suppress duplicate error logs
-              }
-            }
-
-            // Reload search results after syncing transactions
-            performSearch(searchQuery);
-          } catch (syncError) {
-            console.warn("Failed to sync transactions to SQLite:", syncError);
-          }
-        },
-        (error) => {
-          console.error("Firebase transactions listener error:", error);
-        }
-      );
-
-      return () => {
-        unsubscribeTransactions();
+  // Get category info for a transaction
+  const getCategoryInfo = (categoryId: string | null | undefined) => {
+    if (!categoryId) {
+      return {
+        name: "Không phân loại",
+        icon: "tag",
+        color: "#9E9E9E",
       };
-    }, [searchQuery, performSearch])
-  );
+    }
+    const category = categories.find((cat) => cat.id === categoryId);
+    return {
+      name: category?.name || "Không phân loại",
+      icon: category?.icon || "tag",
+      color: category?.color || "#9E9E9E",
+    };
+  };
 
   const renderTransactionItem = ({ item }: { item: Transaction }) => {
-    // Get category info if available
-    const categoryName = (item as any).categoryName || "Không phân loại";
-    const categoryIcon = (item as any).categoryIcon || "tag";
-    const categoryColor = (item as any).categoryColor || "#9E9E9E";
+    // Get category info
+    const categoryInfo = getCategoryInfo(item.categoryId);
 
     return (
       <TouchableOpacity
@@ -293,16 +241,22 @@ const Timkiem = () => {
             <View
               style={[
                 styles.categoryIcon,
-                { backgroundColor: categoryColor + "20" },
+                { backgroundColor: categoryInfo.color + "20" },
               ]}
             >
-              <Icon name={categoryIcon} size={20} color={categoryColor} />
+              <Icon
+                name={categoryInfo.icon}
+                size={20}
+                color={categoryInfo.color}
+              />
             </View>
             <View style={styles.transactionInfo}>
               <Text style={styles.transactionCategory}>
                 {item.description || "Không có ghi chú"}
               </Text>
-              <Text style={styles.transactionCategoryName}>{categoryName}</Text>
+              <Text style={styles.transactionCategoryName}>
+                {categoryInfo.name}
+              </Text>
             </View>
           </View>
           {item.merchantName && (
@@ -338,26 +292,6 @@ const Timkiem = () => {
     <View style={styles.container}>
       {/* Header */}
       <View style={styles.header}>
-        <View style={styles.statusBar}>
-          <Text style={styles.statusTime}>10:35</Text>
-          <View style={styles.statusIcons}>
-            <Icon name="volume-variant-off" size={16} color="#fff" />
-            <Icon
-              name="signal-cellular-3"
-              size={16}
-              color="#fff"
-              style={{ marginLeft: 6 }}
-            />
-            <Text style={styles.statusBattery}>56%</Text>
-            <Icon
-              name="battery-50"
-              size={16}
-              color="#fff"
-              style={{ marginLeft: 4 }}
-            />
-          </View>
-        </View>
-
         <View style={styles.headerContent}>
           <TouchableOpacity
             onPress={() => navigation.goBack()}
@@ -609,15 +543,6 @@ const Timkiem = () => {
           </>
         )}
       </View>
-
-      {/* Bottom Navigation */}
-      <View style={styles.bottomNav}>
-        <View style={styles.navButtons}>
-          <View style={styles.navDivider} />
-          <View style={styles.navSquare} />
-          <Icon name="chevron-left" size={32} color="#666" />
-        </View>
-      </View>
     </View>
   );
 };
@@ -629,34 +554,13 @@ const styles = StyleSheet.create({
   },
   header: {
     backgroundColor: "#2196F3",
-    paddingTop: 10,
-  },
-  statusBar: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    paddingHorizontal: 20,
-    paddingVertical: 8,
-  },
-  statusTime: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "500",
-  },
-  statusIcons: {
-    flexDirection: "row",
-    alignItems: "center",
-  },
-  statusBattery: {
-    color: "#fff",
-    fontSize: 14,
-    marginLeft: 8,
+    paddingTop: 50,
+    paddingBottom: 16,
   },
   headerContent: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 16,
-    paddingVertical: 16,
   },
   backButton: {
     marginRight: 16,
@@ -864,31 +768,6 @@ const styles = StyleSheet.create({
   },
   incomeAmount: {
     color: "#4CAF50",
-  },
-  bottomNav: {
-    backgroundColor: "#fff",
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-    borderTopWidth: 1,
-    borderTopColor: "#E0E0E0",
-  },
-  navButtons: {
-    flexDirection: "row",
-    justifyContent: "center",
-    alignItems: "center",
-    gap: 40,
-  },
-  navDivider: {
-    width: 2,
-    height: 32,
-    backgroundColor: "#666",
-  },
-  navSquare: {
-    width: 28,
-    height: 28,
-    borderWidth: 2,
-    borderColor: "#666",
-    borderRadius: 4,
   },
 });
 

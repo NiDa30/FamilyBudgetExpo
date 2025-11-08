@@ -13,6 +13,7 @@ import {
   deleteDoc,
   writeBatch,
 } from "firebase/firestore";
+import { COLLECTIONS } from "../../constants/collections";
 import { Transaction, UUID } from "../../domain/types";
 
 export const FirestoreAdapter = {
@@ -21,13 +22,13 @@ export const FirestoreAdapter = {
     lastModifiedAfter?: string
   ): Promise<Transaction[]> {
     let q = query(
-      collection(db, "transactions"),
-      where("userId", "==", userId)
+      collection(db, COLLECTIONS.TRANSACTIONS),
+      where("userID", "==", userId)
     );
     if (lastModifiedAfter) {
       q = query(
-        collection(db, "transactions"),
-        where("userId", "==", userId),
+        collection(db, COLLECTIONS.TRANSACTIONS),
+        where("userID", "==", userId),
         where("lastModifiedAt", ">", lastModifiedAfter)
       );
     }
@@ -38,7 +39,7 @@ export const FirestoreAdapter = {
   async upsertTransactions(transactions: Transaction[]): Promise<void> {
     const batch = writeBatch(db);
     for (const t of transactions) {
-      const ref = doc(collection(db, "transactions"), t.id);
+      const ref = doc(collection(db, COLLECTIONS.TRANSACTIONS), t.id);
       batch.set(ref, t, { merge: true });
     }
     await batch.commit();
@@ -47,7 +48,7 @@ export const FirestoreAdapter = {
   async deleteTransactions(ids: UUID[]): Promise<void> {
     const batch = writeBatch(db);
     for (const id of ids) {
-      batch.delete(doc(db, "transactions", id));
+      batch.delete(doc(db, COLLECTIONS.TRANSACTIONS, id));
     }
     await batch.commit();
   },

@@ -107,7 +107,8 @@ export const AuthService = {
 
     // Delete user document (and let CF/Rules handle cascading tasks if any)
     try {
-      await deleteDoc(doc(db, "USER", userId));
+      const { COLLECTIONS } = await import("../../constants/collections");
+      await deleteDoc(doc(db, COLLECTIONS.USER, userId));
     } catch (e) {
       // ignore if not exists
     }

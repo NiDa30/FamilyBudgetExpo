@@ -5,6 +5,7 @@ export const runMigrations = async (db) => {
 
   try {
     await addMissingTransactionColumns(db);
+    await addMissingCategoryColumns(db);
     await fixCategoryIdConstraint(db); // Add this line
     console.log("All migrations completed successfully!");
   } catch (error) {
@@ -91,6 +92,52 @@ export const addMissingTransactionColumns = async (db) => {
   }
 };
 
+// Add missing category columns
+export const addMissingCategoryColumns = async (db) => {
+  console.log("Checking for missing category columns...");
+
+  if (!db) {
+    throw new Error("Database instance not available");
+  }
+
+  try {
+    // Add display_order column if it doesn't exist
+    try {
+      await db.execAsync("ALTER TABLE categories ADD COLUMN display_order INTEGER DEFAULT 0");
+      console.log("Added display_order column to categories table");
+    } catch (error) {
+      if (!error.message.includes("duplicate column name") && !error.message.includes("already exists")) {
+        console.warn("Warning adding display_order:", error.message);
+      }
+    }
+
+    // Add is_hidden column if it doesn't exist
+    try {
+      await db.execAsync("ALTER TABLE categories ADD COLUMN is_hidden INTEGER DEFAULT 0");
+      console.log("Added is_hidden column to categories table");
+    } catch (error) {
+      if (!error.message.includes("duplicate column name") && !error.message.includes("already exists")) {
+        console.warn("Warning adding is_hidden:", error.message);
+      }
+    }
+
+    // Ensure tags column exists in transactions table
+    try {
+      await db.execAsync("ALTER TABLE transactions ADD COLUMN tags TEXT");
+      console.log("Added tags column to transactions table");
+    } catch (error) {
+      if (!error.message.includes("duplicate column name") && !error.message.includes("already exists")) {
+        console.warn("Warning adding tags:", error.message);
+      }
+    }
+
+    console.log("Category table schema check completed");
+  } catch (error) {
+    console.error("Error adding missing category columns:", error);
+    throw error;
+  }
+};
+
 // Add this new function to fix the category_id constraint
 export const fixCategoryIdConstraint = async (db) => {
   console.log("Checking and fixing category_id constraint...");
@@ -146,5 +193,6 @@ export const fixCategoryIdConstraint = async (db) => {
 export default {
   runMigrations,
   addMissingTransactionColumns,
+  addMissingCategoryColumns,
   fixCategoryIdConstraint,
 };

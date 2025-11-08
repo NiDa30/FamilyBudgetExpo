@@ -2,6 +2,7 @@
 import * as SQLite from "expo-sqlite";
 import {
   addMissingTransactionColumns,
+  addMissingCategoryColumns,
   fixCategoryIdConstraint,
   runMigrations,
 } from "./migrations"; // Update import
@@ -11,6 +12,7 @@ class DatabaseService {
     this.db = null;
     this.isInitialized = false;
     this.initPromise = null;
+    this._removingDuplicates = false; // Flag to prevent concurrent duplicate removal
   }
 
   async initialize() {
@@ -40,14 +42,8 @@ class DatabaseService {
       console.log("Creating tables...");
       await this.createTables();
 
-      console.log("Adding missing transaction columns...");
-      await addMissingTransactionColumns(this.db);
-
       console.log("Running database migrations...");
       await runMigrations(this.db);
-
-      console.log("Fixing category_id constraint...");
-      await fixCategoryIdConstraint(this.db); // Update this line
 
       this.isInitialized = true;
       console.log("SQLite Database initialized successfully");
@@ -72,6 +68,8 @@ class DatabaseService {
         icon TEXT DEFAULT 'food-apple',
         color TEXT DEFAULT '#FF6347',
         is_system_default INTEGER DEFAULT 0,
+        display_order INTEGER DEFAULT 0,
+        is_hidden INTEGER DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         is_synced INTEGER DEFAULT 0,
@@ -131,6 +129,10 @@ class DatabaseService {
 
   async getCategoriesByUser(userId) {
     await this.ensureInitialized();
+    
+    // Note: Duplicate removal is handled during sync, not here to avoid performance issues
+    // If duplicates exist, they will be removed during the next sync operation
+    
     return await this.db.getAllAsync(
       `SELECT * FROM categories 
        WHERE user_id = ? AND deleted_at IS NULL 
@@ -151,31 +153,77 @@ class DatabaseService {
     );
   }
 
+  /**
+   * Get unsynced categories (is_synced = 0)
+   */
+  async getUnsyncedCategories(userId) {
+    await this.ensureInitialized();
+    return await this.db.getAllAsync(
+      `SELECT * FROM categories 
+       WHERE user_id = ? 
+       AND (is_synced = 0 OR is_synced IS NULL) 
+       AND deleted_at IS NULL 
+       ORDER BY updated_at ASC`,
+      [userId]
+    );
+  }
+
   async createCategory(category) {
     await this.ensureInitialized();
-    const now = Date.now();
-
-    await this.db.runAsync(
-      `INSERT OR REPLACE INTO categories (
-        id, user_id, name, type, budget_group, icon, color,
-        is_system_default, created_at, updated_at, is_synced, deleted_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM categories WHERE id = ?), ?), ?, 0, NULL)`,
-      [
-        category.id,
-        category.user_id,
-        category.name,
-        category.type || "EXPENSE",
-        category.budget_group || "Nhu cầu",
-        category.icon || "food-apple",
-        category.color || "#FF6347",
-        category.is_system_default || 0,
-        category.id, // For COALESCE to preserve existing created_at
-        now, // Fallback created_at if new
-        now, // updated_at
-      ]
+    
+    // Check if category with same name+type+user already exists (by name, not ID)
+    const existingId = await this.categoryExistsByName(
+      category.user_id,
+      category.name,
+      category.type || "EXPENSE"
     );
 
-    return { ...category, created_at: now, updated_at: now };
+    if (existingId && existingId !== category.id) {
+      // Category with same name+type already exists with different ID
+      // Update the existing one instead of creating duplicate
+      console.log(
+        `⚠️ Category "${category.name}" (${category.type || "EXPENSE"}) already exists with ID ${existingId}, updating instead of creating duplicate`
+      );
+      await this.updateCategory(existingId, {
+        icon: category.icon || "food-apple",
+        color: category.color || "#FF6347",
+        budget_group: category.budget_group || "Nhu cầu",
+        is_system_default: category.is_system_default || 0,
+      });
+      return { ...category, id: existingId };
+    }
+
+    const now = Date.now();
+
+    try {
+      await this.db.runAsync(
+        `INSERT OR REPLACE INTO categories (
+          id, user_id, name, type, budget_group, icon, color,
+          is_system_default, display_order, is_hidden, created_at, updated_at, is_synced, deleted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM categories WHERE id = ?), ?), ?, 0, NULL)`,
+        [
+          category.id,
+          category.user_id,
+          category.name,
+          category.type || "EXPENSE",
+          category.budget_group || "Nhu cầu",
+          category.icon || "food-apple",
+          category.color || "#FF6347",
+          category.is_system_default || 0,
+          category.display_order ?? category.displayOrder ?? 0,
+          category.is_hidden ?? category.isHidden ?? 0,
+          category.id, // For COALESCE to preserve existing created_at
+          now, // Fallback created_at if new
+          now, // updated_at
+        ]
+      );
+
+      return { ...category, created_at: now, updated_at: now };
+    } catch (error) {
+      // If still fails, log and rethrow
+      console.error(`Error creating category ${category.name}:`, error);
+      throw error;
+    }
   }
 
   async updateCategory(categoryId, updates) {
@@ -184,9 +232,18 @@ class DatabaseService {
     const fields = [];
     const values = [];
 
+    // Map camelCase to snake_case for database columns
+    const columnMap = {
+      displayOrder: "display_order",
+      isHidden: "is_hidden",
+      isSystemDefault: "is_system_default",
+      budgetGroup: "budget_group",
+    };
+
     Object.keys(updates).forEach((key) => {
-      if (key !== "updated_at" && key !== "is_synced") {
-        fields.push(`${key} = ?`);
+      if (key !== "updated_at" && key !== "is_synced" && updates[key] !== undefined) {
+        const dbColumn = columnMap[key] || key;
+        fields.push(`${dbColumn} = ?`);
         values.push(updates[key]);
       }
     });
@@ -207,6 +264,108 @@ class DatabaseService {
       `UPDATE categories SET deleted_at = ?, updated_at = ?, is_synced = 0 WHERE id = ?`,
       [now, now, categoryId]
     );
+  }
+
+  /**
+   * Remove duplicate categories (same name + user_id + type)
+   * Keeps the first one (oldest created_at) and deletes the rest
+   */
+  async removeDuplicateCategories(userId) {
+    await this.ensureInitialized();
+    
+    // Prevent concurrent execution
+    if (this._removingDuplicates) {
+      return 0;
+    }
+    
+    this._removingDuplicates = true;
+    
+    try {
+      // Use a single transaction to avoid database locking issues
+      await this.db.execAsync("BEGIN TRANSACTION");
+      
+      try {
+        // Find duplicate categories grouped by name, user_id, and type
+        const duplicates = await this.db.getAllAsync(
+          `SELECT name, user_id, type, COUNT(*) as count
+           FROM categories
+           WHERE user_id = ? AND deleted_at IS NULL
+           GROUP BY name, user_id, type
+           HAVING count > 1`,
+          [userId]
+        );
+
+        if (duplicates.length === 0) {
+          await this.db.execAsync("COMMIT");
+          return 0;
+        }
+
+        let deletedCount = 0;
+        const now = Date.now();
+
+        for (const dup of duplicates) {
+          // Get all categories with this name+type combination
+          const categories = await this.db.getAllAsync(
+            `SELECT id, created_at FROM categories
+             WHERE user_id = ? AND name = ? AND type = ? AND deleted_at IS NULL
+             ORDER BY created_at ASC, id ASC`,
+            [userId, dup.name, dup.type]
+          );
+
+          if (categories.length > 1) {
+            // Keep the first one (oldest), delete the rest
+            const deleteIds = categories.slice(1).map((c) => c.id);
+
+            // Delete all duplicates in one query
+            const placeholders = deleteIds.map(() => "?").join(",");
+            await this.db.runAsync(
+              `UPDATE categories SET deleted_at = ?, updated_at = ?, is_synced = 0 
+               WHERE id IN (${placeholders})`,
+              [now, now, ...deleteIds]
+            );
+            
+            deletedCount += deleteIds.length;
+
+            if (deleteIds.length > 0) {
+              console.log(
+                `🗑️ Removed ${deleteIds.length} duplicate categories: ${dup.name} (${dup.type})`
+              );
+            }
+          }
+        }
+
+        await this.db.execAsync("COMMIT");
+
+        if (deletedCount > 0) {
+          console.log(`✅ Removed ${deletedCount} duplicate categories for user ${userId}`);
+        }
+
+        return deletedCount;
+      } catch (error) {
+        await this.db.execAsync("ROLLBACK");
+        throw error;
+      }
+    } catch (error) {
+      // Don't throw error, just log it to avoid breaking the app
+      console.warn("Error removing duplicate categories:", error);
+      return 0;
+    } finally {
+      this._removingDuplicates = false;
+    }
+  }
+
+  /**
+   * Check if category exists by name, user_id, and type
+   */
+  async categoryExistsByName(userId, name, type) {
+    await this.ensureInitialized();
+    const result = await this.db.getFirstAsync(
+      `SELECT id FROM categories
+       WHERE user_id = ? AND name = ? AND type = ? AND deleted_at IS NULL
+       LIMIT 1`,
+      [userId, name, type]
+    );
+    return result ? result.id : null;
   }
 
   // ==================== TRANSACTIONS ====================
@@ -570,7 +729,6 @@ export async function addDefaultCategories(userId) {
           isHidden: false,
         });
         await databaseService.markAsSynced("categories", category.id);
-        console.log(`✅ Synced category "${category.name}" to Firebase`);
       } catch (firebaseError) {
         console.warn(
           `Failed to sync category "${category.name}" to Firebase:`,
@@ -585,12 +743,17 @@ export async function addDefaultCategories(userId) {
     }
   }
 
-  console.log(
-    `✅ Created ${defaultCategories.length} default categories for user ${userId}`
-  );
+  // Log only once after all categories are created
+  if (defaultCategories.length > 0) {
+    console.log(
+      `✅ Created ${defaultCategories.length} default categories for user ${userId}`
+    );
+  }
 }
 
 // ✅ NEW FUNCTION: Initialize categories if not exists and sync to Firebase
+// NOTE: Default categories should be loaded from CATEGORIES_DEFAULT collection,
+// not created here. This function only syncs user categories.
 export async function ensureCategoriesInitialized(userId) {
   try {
     await databaseService.ensureInitialized();
@@ -603,20 +766,23 @@ export async function ensureCategoriesInitialized(userId) {
         `✅ User ${userId} already has ${existingCategories.length} categories`
       );
 
-      // Check if any categories need Firebase sync
+      // Check if any categories need Firebase sync (only user categories, not default ones)
       const unsyncedCategories = existingCategories.filter(
-        (cat) => !cat.is_synced || cat.is_synced === 0
+        (cat) => (!cat.is_synced || cat.is_synced === 0) && cat.is_system_default !== 1
       );
 
       if (unsyncedCategories.length > 0 && userId) {
         console.log(
-          `🔄 Syncing ${unsyncedCategories.length} unsynced categories to Firebase...`
+          `🔄 Syncing ${unsyncedCategories.length} unsynced user categories to Firebase...`
         );
 
         try {
           const FirebaseService = (
             await import("../service/firebase/FirebaseService")
           ).default;
+
+          let syncedCount = 0;
+          let failedCount = 0;
 
           for (const category of unsyncedCategories) {
             try {
@@ -629,16 +795,28 @@ export async function ensureCategoriesInitialized(userId) {
                 isSystemDefault: category.is_system_default === 1,
                 displayOrder: category.display_order || 0,
                 isHidden: category.is_hidden === 1,
+                budget_group: category.budget_group,
               });
 
               await databaseService.markAsSynced("categories", category.id);
-              console.log(`✅ Synced category "${category.name}" to Firebase`);
+              syncedCount++;
             } catch (syncError) {
-              console.warn(
-                `Failed to sync category "${category.name}" to Firebase:`,
-                syncError
-              );
+              failedCount++;
+              // Only log individual errors in development
+              if (__DEV__) {
+                console.warn(
+                  `Failed to sync category "${category.name}" to Firebase:`,
+                  syncError
+                );
+              }
             }
+          }
+
+          // Log batch results
+          if (syncedCount > 0) {
+            console.log(
+              `✅ Synced ${syncedCount} user categories to Firebase${failedCount > 0 ? ` (${failedCount} failed)` : ""}`
+            );
           }
         } catch (firebaseError) {
           console.warn("FirebaseService not available:", firebaseError);
@@ -648,11 +826,11 @@ export async function ensureCategoriesInitialized(userId) {
       return;
     }
 
-    // No categories found, create default ones
+    // No categories found - Default categories should be loaded from CATEGORIES_DEFAULT
+    // Don't create default categories here, let the calling code load from Firebase
     console.log(
-      `📝 No categories found for user ${userId}, creating default categories...`
+      `📝 No categories found for user ${userId}. Default categories should be loaded from CATEGORIES_DEFAULT collection.`
     );
-    await addDefaultCategories(userId);
   } catch (error) {
     console.error("Error ensuring categories initialized:", error);
     throw error;

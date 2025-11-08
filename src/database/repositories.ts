@@ -317,8 +317,9 @@ export const CategoryRepository = {
         return [];
       }
       
+      // Use COALESCE for display_order in case column doesn't exist in older database
       const result = await runAsync(
-        "SELECT * FROM categories WHERE user_id IS NULL OR user_id = ? ORDER BY display_order ASC, name ASC",
+        "SELECT * FROM categories WHERE (user_id IS NULL OR user_id = ?) AND (deleted_at IS NULL) ORDER BY COALESCE(display_order, 0) ASC, name ASC",
         [userId]
       );
       
@@ -327,7 +328,26 @@ export const CategoryRepository = {
       }
       
       return result.rows.map(mapRowToCategory);
-    } catch (error) {
+    } catch (error: any) {
+      // If display_order column doesn't exist, try without it
+      const errorMessage = error?.message || String(error);
+      if (errorMessage.includes("display_order") || errorMessage.includes("no such column")) {
+        try {
+          const result = await runAsync(
+            "SELECT * FROM categories WHERE (user_id IS NULL OR user_id = ?) AND (deleted_at IS NULL) ORDER BY name ASC",
+            [userId]
+          );
+          
+          if (!result || !result.rows || !Array.isArray(result.rows)) {
+            return [];
+          }
+          
+          return result.rows.map(mapRowToCategory);
+        } catch (fallbackError) {
+          logErrorOnce("category_list_fallback_error", "CategoryRepository.listByUser fallback error:", fallbackError);
+          return [];
+        }
+      }
       logErrorOnce("category_list_error", "CategoryRepository.listByUser error:", error);
       return [];
     }

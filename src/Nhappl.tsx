@@ -1,6 +1,11 @@
-import { useNavigation } from "@react-navigation/native";
+import {
+  useFocusEffect,
+  useNavigation,
+  useRoute,
+} from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import { useEffect, useState } from "react";
+import { collection, onSnapshot, query, where } from "firebase/firestore";
+import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -14,20 +19,23 @@ import {
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { RootStackParamList } from "../App";
+import { COLLECTIONS } from "./constants/collections";
 import { CategoryService as DatabaseService } from "./database/databaseService";
-import { authInstance as auth } from "./firebaseConfig"; // Sửa import
+import { authInstance as auth, dbInstance as db } from "./firebaseConfig";
 import SyncEngine from "./service/sync/SyncEngine";
 
 type Category = {
   id: string;
   name: string;
-  icon: string;
-  color: string;
-  type?: string;
+  icon?: string;
+  color?: string;
+  type?: "EXPENSE" | "INCOME";
   budget_group?: string;
   user_id?: string;
   is_system_default?: number;
+  isSystemDefault?: boolean;
   createdAt?: any;
+  updatedAt?: number;
 };
 
 type CategoryManagementScreenNavigationProp = NativeStackNavigationProp<
@@ -37,6 +45,7 @@ type CategoryManagementScreenNavigationProp = NativeStackNavigationProp<
 
 const CategoryManagementScreen = () => {
   const navigation = useNavigation<CategoryManagementScreenNavigationProp>();
+  const route = useRoute<any>(); // ✅ Thêm route để nhận params
 
   // ✅ SỬA LỖI: Dùng useState để lấy userId
   const [userId, setUserId] = useState<string | null>(null);
@@ -44,7 +53,13 @@ const CategoryManagementScreen = () => {
   const [newCategoryName, setNewCategoryName] = useState("");
   const [selectedIcon, setSelectedIcon] = useState("food-apple");
   const [selectedColor, setSelectedColor] = useState("#FF6347");
-  const [categories, setCategories] = useState<Category[]>([]);
+  // ✅ Nhận initialBudgetGroup từ route params nếu có
+  const initialBudgetGroup = route.params?.initialBudgetGroup || "Chi tiêu";
+  const [selectedBudgetGroup, setSelectedBudgetGroup] =
+    useState<string>(initialBudgetGroup);
+  const [categories, setCategories] = useState<Category[]>([]); // Combined categories (default + user)
+  const [defaultCategories, setDefaultCategories] = useState<Category[]>([]); // Default categories (read-only)
+  const [userCategories, setUserCategories] = useState<Category[]>([]); // User categories (editable)
   const [isLoading, setIsLoading] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
 
@@ -97,6 +112,53 @@ const CategoryManagementScreen = () => {
     "music",
   ];
 
+  // ✅ CẬP NHẬT: Chỉ có 2 nhóm chi phí
+  const budgetGroups = ["Chi tiêu", "Thu nhập"];
+
+  // ✅ HELPER: Lấy type từ budget_group
+  const getTypeFromBudgetGroup = (
+    budgetGroup: string
+  ): "EXPENSE" | "INCOME" => {
+    return budgetGroup === "Chi tiêu" ? "EXPENSE" : "INCOME";
+  };
+
+  // ✅ HELPER: Lấy categories theo budget_group
+  const getCategoriesByBudgetGroup = (budgetGroup: string) => {
+    return categories.filter((cat) => {
+      if (budgetGroup === "Chi tiêu") {
+        return (
+          cat.budget_group === "Chi tiêu" ||
+          (!cat.budget_group && (cat.type === "EXPENSE" || !cat.type))
+        );
+      } else {
+        // Thu nhập
+        return (
+          cat.budget_group === "Thu nhập" ||
+          (!cat.budget_group && cat.type === "INCOME")
+        );
+      }
+    });
+  };
+
+  // ✅ Lấy số lượng categories cho mỗi nhóm (từ combined categories)
+  const chiTieuCount = categories.filter((cat) => {
+    const catBudgetGroup =
+      cat.budget_group || (cat.type === "EXPENSE" ? "Chi tiêu" : "Thu nhập");
+    return catBudgetGroup === "Chi tiêu";
+  }).length;
+  const thuNhapCount = categories.filter((cat) => {
+    const catBudgetGroup =
+      cat.budget_group || (cat.type === "EXPENSE" ? "Chi tiêu" : "Thu nhập");
+    return catBudgetGroup === "Thu nhập";
+  }).length;
+
+  // ✅ Lấy categories hiện tại dựa trên selectedBudgetGroup
+  const currentDisplayCategories = categories.filter((cat) => {
+    const catBudgetGroup =
+      cat.budget_group || (cat.type === "EXPENSE" ? "Chi tiêu" : "Thu nhập");
+    return catBudgetGroup === selectedBudgetGroup;
+  });
+
   // ✅ THÊM MỚI: useEffect để lấy userId từ Firebase Auth
   useEffect(() => {
     // Lắng nghe sự thay đổi trạng thái đăng nhập từ Firebase
@@ -125,6 +187,79 @@ const CategoryManagementScreen = () => {
     }
   }, [userId]);
 
+  // ✅ REAL-TIME SYNC: Setup Firebase listeners for categories
+  useFocusEffect(
+    useCallback(() => {
+      if (!userId) return;
+
+      console.log(
+        "🔄 Nhappl screen focused, setting up real-time listeners..."
+      );
+      let isActive = true;
+
+      // Setup Firebase real-time listener for categories
+      const categoriesQuery = query(
+        collection(db, COLLECTIONS.CATEGORIES),
+        where("userID", "==", userId),
+        where("isHidden", "==", false)
+      );
+
+      // Debounce timer để tránh sync quá nhiều lần
+      let categorySyncTimeout: ReturnType<typeof setTimeout> | null = null;
+      let lastCategorySyncTime = 0;
+      const CATEGORY_SYNC_DEBOUNCE_MS = 2000; // 2 seconds debounce
+
+      const unsubscribeCategories = onSnapshot(
+        categoriesQuery,
+        async (snapshot) => {
+          if (!isActive) return;
+
+          // Check if there are actual changes
+          const changes = snapshot.docChanges();
+          if (changes.length === 0) {
+            return; // No changes, skip sync
+          }
+
+          console.log(
+            `📋 Firebase categories updated: ${changes.length} changes detected`
+          );
+
+          const now = Date.now();
+          // Debounce: skip if synced too recently
+          if (now - lastCategorySyncTime < CATEGORY_SYNC_DEBOUNCE_MS) {
+            // Clear existing timeout and set a new one
+            if (categorySyncTimeout) {
+              clearTimeout(categorySyncTimeout);
+            }
+            categorySyncTimeout = setTimeout(async () => {
+              if (isActive) {
+                await syncFromFirebaseAndUpdate();
+                lastCategorySyncTime = Date.now();
+              }
+            }, CATEGORY_SYNC_DEBOUNCE_MS);
+            return;
+          }
+
+          lastCategorySyncTime = now;
+          await syncFromFirebaseAndUpdate();
+        },
+        (error) => {
+          console.error("❌ Firebase categories listener error:", error);
+        }
+      );
+
+      // Return cleanup function
+      return () => {
+        isActive = false;
+        if (categorySyncTimeout) {
+          clearTimeout(categorySyncTimeout);
+        }
+        unsubscribeCategories();
+        console.log("🔄 Nhappl screen unfocused, cleaned up listeners");
+      };
+    }, [userId])
+  );
+
   /**
    * 🚀 KHỞI TẠO DỮ LIỆU - OPTIMIZED
    * 1. Load SQLite trước → Hiển thị UI ngay
@@ -152,23 +287,219 @@ const CategoryManagementScreen = () => {
   };
 
   /**
-   * Load categories từ SQLite
+   * Load categories: Default from Firebase + User from SQLite
+   * Flow: Firebase (Default) → SQLite (User) → Combine → Display → Sync User Categories
    */
   const loadCategoriesFromSQLite = async () => {
     if (!userId) return;
 
     try {
-      const cats = await DatabaseService.getCategoriesByUser(userId);
-      setCategories(cats);
-      console.log(`💾 Loaded ${cats.length} categories from SQLite`);
-    } catch (error) {
-      console.error("Failed to load categories from SQLite:", error);
-      throw error;
+      setIsLoading(true);
+      console.log("📋 Starting to load categories...");
+
+      const CategoryService = (await import("./services/categoryService"))
+        .default;
+
+      // ✅ BƯỚC 1: LOAD DEFAULT CATEGORIES FROM FIREBASE (先にデフォルトカテゴリをロード)
+      console.log("📋 Step 1: Loading default categories from Firebase...");
+      const defaultCatsFromFirebase =
+        await CategoryService.loadDefaultCategoriesFromFirebase();
+      console.log(
+        `📋 Loaded ${defaultCatsFromFirebase.length} default categories from Firebase`
+      );
+
+      // ✅ BƯỚC 2: LOAD USER CATEGORIES FROM SQLITE
+      console.log("📋 Step 2: Loading user categories from SQLite...");
+      const userCatsFromSQLite =
+        await CategoryService.loadUserCategoriesFromSQLite(userId);
+      console.log(
+        `📋 Loaded ${userCatsFromSQLite.length} user categories from SQLite`
+      );
+
+      // ✅ BƯỚC 3: COMBINE CATEGORIES (Default + User)
+      console.log("📋 Step 3: Combining categories...");
+      const combined: Category[] = [];
+
+      // Add user categories first (these override defaults if same name+type)
+      userCatsFromSQLite.forEach((cat) => {
+        combined.push({
+          ...cat,
+          isSystemDefault: false,
+        });
+      });
+
+      // Add default categories that are not in user list
+      defaultCatsFromFirebase.forEach((defaultCat) => {
+        // Check if this default category is already in user categories (by name + type)
+        const existsInUser = userCatsFromSQLite.some(
+          (userCat) =>
+            userCat.name.toLowerCase().trim() ===
+              defaultCat.name.toLowerCase().trim() &&
+            userCat.type === defaultCat.type
+        );
+
+        if (!existsInUser) {
+          combined.push({
+            ...defaultCat,
+            isSystemDefault: true, // Mark as system default (read-only)
+          });
+        }
+      });
+
+      console.log(
+        `📋 Combined ${combined.length} total categories (${defaultCatsFromFirebase.length} default + ${userCatsFromSQLite.length} user)`
+      );
+
+      // ✅ BƯỚC 4: FILTER BY SELECTED BUDGET GROUP
+      const filteredCats = combined.filter((cat) => {
+        const catBudgetGroup =
+          cat.budget_group ||
+          (cat.type === "EXPENSE" ? "Chi tiêu" : "Thu nhập");
+        return catBudgetGroup === selectedBudgetGroup;
+      });
+
+      // Separate default and user categories for UI (for counting)
+      const defaultCats = combined.filter((cat) => cat.isSystemDefault);
+      const userCats = combined.filter((cat) => !cat.isSystemDefault);
+
+      // ✅ BƯỚC 5: UPDATE UI
+      setCategories(filteredCats as Category[]);
+      setDefaultCategories(defaultCats);
+      setUserCategories(userCats);
+
+      console.log(
+        `💾 Displayed ${filteredCats.length} categories for "${selectedBudgetGroup}" (${defaultCats.length} default + ${userCats.length} user total)`
+      );
+
+      setIsLoading(false);
+
+      // ✅ BƯỚC 6: SYNC USER CATEGORIES FROM FIREBASE (Background - không block UI)
+      // Only sync user categories (CATEGORIES), not default categories (CATEGORIES_DEFAULT)
+      syncFromFirebaseAndUpdate();
+    } catch (error: any) {
+      console.error("❌ Failed to load categories:", error);
+      console.error("❌ Error details:", error?.message, error?.stack);
+      setIsLoading(false);
+      // Don't throw error, just show alert
+      Alert.alert(
+        "Lỗi",
+        `Không thể tải danh mục: ${error?.message || "Unknown error"}`
+      );
+    }
+  };
+
+  /**
+   * Sync user categories từ Firebase và cập nhật UI
+   * Note: Default categories (CATEGORIES_DEFAULT) are read-only, only sync user categories (CATEGORIES)
+   */
+  const syncFromFirebaseAndUpdate = async () => {
+    if (!userId) return;
+
+    try {
+      console.log("🔄 Starting Firebase sync for user categories...");
+      const CategoryService = (await import("./services/categoryService"))
+        .default;
+
+      // ✅ BƯỚC 1: Sync user categories từ Firebase → SQLite
+      const syncResult = await CategoryService.syncFirebaseToSQLite(userId);
+
+      if (syncResult.synced > 0 || syncResult.conflicts > 0) {
+        console.log(
+          `🔄 Synced ${syncResult.synced} user categories from Firebase, resolved ${syncResult.conflicts} conflicts`
+        );
+
+        // ✅ BƯỚC 2: Reload default categories from Firebase (always fresh)
+        console.log("📋 Reloading default categories from Firebase...");
+        const defaultCatsFromFirebase =
+          await CategoryService.loadDefaultCategoriesFromFirebase();
+        console.log(
+          `📋 Reloaded ${defaultCatsFromFirebase.length} default categories from Firebase`
+        );
+
+        // ✅ BƯỚC 3: Reload user categories from SQLite (after sync)
+        console.log("📋 Reloading user categories from SQLite...");
+        const userCatsFromSQLite =
+          await CategoryService.loadUserCategoriesFromSQLite(userId);
+        console.log(
+          `📋 Reloaded ${userCatsFromSQLite.length} user categories from SQLite`
+        );
+
+        // ✅ BƯỚC 4: Combine categories again
+        const combined: Category[] = [];
+
+        // Add user categories first
+        userCatsFromSQLite.forEach((cat) => {
+          combined.push({
+            ...cat,
+            isSystemDefault: false,
+          });
+        });
+
+        // Add default categories that are not in user list
+        defaultCatsFromFirebase.forEach((defaultCat) => {
+          const existsInUser = userCatsFromSQLite.some(
+            (userCat) =>
+              userCat.name.toLowerCase().trim() ===
+                defaultCat.name.toLowerCase().trim() &&
+              userCat.type === defaultCat.type
+          );
+
+          if (!existsInUser) {
+            combined.push({
+              ...defaultCat,
+              isSystemDefault: true,
+            });
+          }
+        });
+
+        // ✅ BƯỚC 5: Filter by selected budget group
+        const filteredCats = combined.filter((cat) => {
+          const catBudgetGroup =
+            cat.budget_group ||
+            (cat.type === "EXPENSE" ? "Chi tiêu" : "Thu nhập");
+          return catBudgetGroup === selectedBudgetGroup;
+        });
+
+        // Separate default and user categories
+        const defaultCats = combined.filter((cat) => cat.isSystemDefault);
+        const userCats = combined.filter((cat) => !cat.isSystemDefault);
+
+        // ✅ BƯỚC 6: Update UI
+        setCategories(filteredCats as Category[]);
+        setDefaultCategories(defaultCats);
+        setUserCategories(userCats);
+
+        console.log(
+          `✅ Updated UI with ${filteredCats.length} categories after Firebase sync (${defaultCats.length} default + ${userCats.length} user total)`
+        );
+      } else {
+        console.log("ℹ️ No user categories to sync from Firebase");
+      }
+
+      // ✅ BƯỚC 7: Sync unsynced user categories to Firebase
+      const syncToFirebaseResult =
+        await CategoryService.syncAllUnsyncedCategories(userId);
+      if (syncToFirebaseResult.synced > 0) {
+        console.log(
+          `✅ Synced ${syncToFirebaseResult.synced} user categories to Firebase`
+        );
+      }
+      if (syncToFirebaseResult.failed > 0) {
+        console.warn(
+          `⚠️ Failed to sync ${syncToFirebaseResult.failed} categories:`,
+          syncToFirebaseResult.errors
+        );
+      }
+    } catch (error: any) {
+      console.warn("⚠️ Failed to sync from Firebase:", error);
+      console.warn("⚠️ Error details:", error?.message, error?.stack);
+      // App vẫn hoạt động bình thường với data local
     }
   };
 
   /**
    * 🔄 SYNC FIREBASE Ở BACKGROUND - KHÔNG BLOCK UI
+   * Full sync: Pull from Firebase → Push to Firebase
    */
   const syncFirebaseInBackground = async () => {
     if (!userId) return;
@@ -177,27 +508,46 @@ const CategoryManagementScreen = () => {
       setIsSyncing(true);
       console.log("🔄 Background sync started...");
 
-      // Thực hiện full sync (push + pull)
-      await SyncEngine.performSync(userId);
+      const CategoryService = (await import("./services/categoryService"))
+        .default;
 
-      // Sau khi sync xong, reload từ SQLite để có data mới nhất
-      const updatedCategories = await DatabaseService.getCategoriesByUser(
-        userId
+      // Thực hiện full sync (pull + push)
+      const pullResult = await CategoryService.syncFirebaseToSQLite(userId);
+      const pushResult = await CategoryService.syncSQLiteToFirebase(userId);
+
+      const syncResult = {
+        pull: pullResult,
+        push: pushResult,
+      };
+
+      console.log(
+        `✅ Full sync completed: Pulled ${syncResult.pull.synced}, Pushed ${syncResult.push.pushed}`
       );
 
-      // CHỈ UPDATE UI NẾU CÓ THAY ĐỔI
-      // Dùng state callback để đảm bảo so sánh với state mới nhất
-      setCategories((prevCategories) => {
-        if (
-          JSON.stringify(updatedCategories) !== JSON.stringify(prevCategories)
-        ) {
-          console.log("🔃 UI updated with synced data");
-          return updatedCategories;
-        } else {
-          console.log("✓ No changes from Firebase");
-          return prevCategories;
-        }
+      // Sau khi sync xong, reload combined categories để có data mới nhất
+      const updatedCategories = await CategoryService.getCombinedCategories(
+        userId
+      );
+      const filteredCats = updatedCategories.filter((cat) => {
+        const catBudgetGroup =
+          cat.budget_group ||
+          (cat.type === "EXPENSE" ? "Chi tiêu" : "Thu nhập");
+        return catBudgetGroup === selectedBudgetGroup;
       });
+
+      // Separate default and user categories
+      const defaultCats = updatedCategories.filter(
+        (cat) => cat.isSystemDefault
+      );
+      const userCats = updatedCategories.filter((cat) => !cat.isSystemDefault);
+
+      // Update UI với dữ liệu mới nhất
+      setCategories(filteredCats as Category[]);
+      setDefaultCategories(defaultCats);
+      setUserCategories(userCats);
+      console.log(
+        `🔃 UI updated with ${filteredCats.length} categories after sync`
+      );
     } catch (error) {
       console.warn("Background sync failed, using local data:", error);
       // App vẫn hoạt động bình thường với data local
@@ -207,7 +557,7 @@ const CategoryManagementScreen = () => {
   };
 
   /**
-   * ➕ THÊM CATEGORY MỚI - OPTIMISTIC UI
+   * ➕ THÊM CATEGORY MỚI - VỚI KIỂM TRA TRÙNG TÊN
    */
   const handleAddCategory = async () => {
     if (!userId) {
@@ -220,59 +570,141 @@ const CategoryManagementScreen = () => {
       return;
     }
 
-    const existingCategory = categories.find(
-      (cat) => cat.name.toLowerCase() === newCategoryName.toLowerCase()
-    );
+    const trimmedName = newCategoryName.trim();
 
-    if (existingCategory) {
-      Alert.alert("Thông báo", "Phân loại này đã tồn tại");
-      return;
-    }
-
-    const newCategory: Category = {
-      id: `cat_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      name: newCategoryName.trim(),
-      icon: selectedIcon,
-      color: selectedColor,
-      type: "EXPENSE",
-      budget_group: "Nhu cầu",
-      user_id: userId,
-      is_system_default: 0,
-    };
+    // ✅ Lấy type từ budget_group
+    const categoryType = getTypeFromBudgetGroup(selectedBudgetGroup);
 
     try {
-      // ⚡ BƯỚC 1: CẬP NHẬT UI NGAY (OPTIMISTIC UPDATE)
-      setCategories((prev) => [...prev, newCategory]);
-      console.log("🎨 UI updated immediately (optimistic)");
+      // ✅ BƯỚC 1: KIỂM TRA TRÙNG TÊN TRONG SQLITE
+      const existingCategoryId = await DatabaseService.categoryExistsByName(
+        userId,
+        trimmedName,
+        categoryType
+      );
 
-      // 💾 BƯỚC 2: LƯU VÀO SQLITE
-      await DatabaseService.createCategory(newCategory);
-      console.log("💾 Saved to SQLite");
+      if (existingCategoryId) {
+        Alert.alert(
+          "Thông báo",
+          `Phân loại "${trimmedName}" (${selectedBudgetGroup}) đã tồn tại trong cơ sở dữ liệu. Vui lòng chọn tên khác.`
+        );
+        return;
+      }
 
-      // 🔄 BƯỚC 3: SYNC LÊN FIREBASE Ở BACKGROUND
-      // Không await - để không block UI
-      SyncEngine.scheduleSync(userId, 1000); // Sync sau 1 giây
-      console.log("⏰ Firebase sync scheduled");
+      // ✅ BƯỚC 2: LƯU CATEGORY VÀO SQLITE (Sử dụng saveUserCategory)
+      const CategoryService = (await import("./services/categoryService"))
+        .default;
+
+      console.log(
+        `💾 Saving category: ${trimmedName} (${selectedBudgetGroup})`
+      );
+      const saveResult = await CategoryService.saveUserCategory(userId, {
+        name: trimmedName,
+        type: categoryType,
+        icon: selectedIcon,
+        color: selectedColor,
+        budget_group: selectedBudgetGroup,
+        isSystemDefault: false, // User-created category
+      });
+
+      if (!saveResult.success) {
+        Alert.alert("Thông báo", saveResult.message);
+        return;
+      }
+
+      console.log(`✅ Saved category to SQLite: ${trimmedName}`);
+
+      // ✅ BƯỚC 3: CẬP NHẬT UI (Reload combined categories)
+      const updatedCats = await CategoryService.getCombinedCategories(userId);
+      const filteredCats = updatedCats.filter((cat) => {
+        const catBudgetGroup =
+          cat.budget_group ||
+          (cat.type === "EXPENSE" ? "Chi tiêu" : "Thu nhập");
+        return catBudgetGroup === selectedBudgetGroup;
+      });
+
+      // Separate default and user categories
+      const defaultCats = updatedCats.filter((cat) => cat.isSystemDefault);
+      const userCats = updatedCats.filter((cat) => !cat.isSystemDefault);
+
+      setCategories(filteredCats as Category[]);
+      setDefaultCategories(defaultCats);
+      setUserCategories(userCats);
+      console.log("🎨 UI updated");
+
+      // ✅ BƯỚC 4: SYNC LÊN FIREBASE NGAY LẬP TỨC (nếu có category được lưu)
+      if (saveResult.category) {
+        console.log(
+          `🔄 Syncing category to Firebase immediately: ${saveResult.category.id}`
+        );
+        try {
+          const syncResult = await CategoryService.syncCategoryToFirebase(
+            userId,
+            saveResult.category.id
+          );
+          if (syncResult.synced) {
+            console.log(
+              `✅ Synced category to Firebase: ${saveResult.category?.name}`
+            );
+          } else {
+            console.warn(`⚠️ Failed to sync category: ${syncResult.message}`);
+            // Still show success message, but warn about sync
+            Alert.alert(
+              "Thành công",
+              `Đã thêm phân loại "${trimmedName}". ${syncResult.message}`,
+              [{ text: "OK" }]
+            );
+            return;
+          }
+        } catch (error: any) {
+          console.error("❌ Error syncing category to Firebase:", error);
+          Alert.alert(
+            "Cảnh báo",
+            `Đã thêm phân loại "${trimmedName}" nhưng không thể đồng bộ lên Firebase. Sẽ thử lại sau.`,
+            [{ text: "OK" }]
+          );
+          return;
+        }
+      }
 
       // Reset form
       setNewCategoryName("");
       setSelectedIcon("food-apple");
       setSelectedColor("#FF6347");
+      setSelectedBudgetGroup("Chi tiêu");
 
-      Alert.alert("Thành công", "Đã thêm phân loại mới", [
-        {
-          text: "OK",
-          onPress: () => navigation.goBack(),
-        },
-      ]);
-    } catch (error) {
-      // ❌ NẾU LỖI: ROLLBACK UI
+      Alert.alert(
+        "Thành công",
+        `Đã thêm phân loại "${trimmedName}" và đồng bộ lên Firebase`,
+        [
+          {
+            text: "OK",
+            onPress: () => {
+              // Reload categories before going back
+              loadCategoriesFromSQLite();
+              navigation.goBack();
+            },
+          },
+        ]
+      );
+    } catch (error: any) {
+      // ❌ NẾU LỖI: XỬ LÝ
       console.error("Error saving category:", error);
 
-      // Remove category khỏi UI
-      setCategories((prev) => prev.filter((cat) => cat.id !== newCategory.id));
+      const errorMessage = error?.message || String(error);
 
-      Alert.alert("Lỗi", "Không thể lưu phân loại. Vui lòng thử lại.");
+      // Kiểm tra nếu lỗi là do trùng tên
+      if (
+        errorMessage.includes("UNIQUE constraint") ||
+        errorMessage.includes("already exists")
+      ) {
+        Alert.alert(
+          "Thông báo",
+          `Phân loại "${trimmedName}" đã tồn tại. Vui lòng chọn tên khác.`
+        );
+      } else {
+        Alert.alert("Lỗi", "Không thể lưu phân loại. Vui lòng thử lại.");
+      }
     }
   };
 
@@ -403,41 +835,211 @@ const CategoryManagementScreen = () => {
         </View>
       </View>
 
-      {/* ✅ CẬP NHẬT: Luôn hiển thị phần này */}
+      {/* ✅ CẬP NHẬT: Budget Group Selection - Chỉ có 2 nhóm với số lượng danh mục */}
+      <View style={styles.budgetGroupSection}>
+        <Text style={styles.sectionTitle}>Nhóm chi phí</Text>
+        <View style={styles.budgetGroupContainer}>
+          {budgetGroups.map((group) => {
+            const groupCount =
+              group === "Chi tiêu" ? chiTieuCount : thuNhapCount;
+            return (
+              <TouchableOpacity
+                key={group}
+                style={[
+                  styles.budgetGroupButton,
+                  selectedBudgetGroup === group &&
+                    styles.budgetGroupButtonActive,
+                ]}
+                onPress={() => setSelectedBudgetGroup(group)}
+              >
+                <Icon
+                  name={group === "Chi tiêu" ? "cash-minus" : "cash-plus"}
+                  size={20}
+                  color={selectedBudgetGroup === group ? "#fff" : "#666"}
+                  style={{ marginRight: 8 }}
+                />
+                <Text
+                  style={[
+                    styles.budgetGroupButtonText,
+                    selectedBudgetGroup === group &&
+                      styles.budgetGroupButtonTextActive,
+                  ]}
+                >
+                  {group}
+                </Text>
+                <View
+                  style={[
+                    styles.categoryCountBadge,
+                    selectedBudgetGroup === group &&
+                      styles.categoryCountBadgeActive,
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.categoryCountBadgeText,
+                      selectedBudgetGroup === group &&
+                        styles.categoryCountBadgeTextActive,
+                    ]}
+                  >
+                    {groupCount}
+                  </Text>
+                </View>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </View>
+
+      {/* ✅ CẬP NHẬT: Hiển thị phân loại theo nhóm đã chọn */}
       <View style={styles.existingCategoriesSection}>
         <Text style={styles.sectionTitle}>
-          Phân loại hiện có ({categories.length})
+          Phân loại hiện có - {selectedBudgetGroup} (
+          {currentDisplayCategories.length})
         </Text>
 
-        {/* Chỉ hiển thị ScrollView khi có data */}
-        {categories.length > 0 ? (
+        {/* ✅ Hiển thị categories theo selectedBudgetGroup */}
+        {currentDisplayCategories.length > 0 ? (
           <ScrollView
             horizontal
             showsHorizontalScrollIndicator={false}
             style={styles.categoriesScroll}
           >
-            {categories.map((cat) => (
-              <View key={cat.id} style={styles.categoryChip}>
-                <View
-                  style={[styles.categoryIcon, { backgroundColor: cat.color }]}
+            {currentDisplayCategories.map((cat) => {
+              const isDefault =
+                cat.is_system_default === 1 || cat.isSystemDefault;
+              return (
+                <TouchableOpacity
+                  key={cat.id}
+                  style={styles.categoryChip}
+                  onPress={async () => {
+                    // Handle category selection
+                    if (isDefault) {
+                      // If default category is selected, add it to user categories
+                      if (userId) {
+                        const CategoryService = (
+                          await import("./services/categoryService")
+                        ).default;
+                        console.log(
+                          `➕ Adding default category to user categories: ${cat.name}`
+                        );
+
+                        const result = await CategoryService.saveUserCategory(
+                          userId,
+                          {
+                            id: cat.id,
+                            name: cat.name,
+                            type: cat.type || "EXPENSE",
+                            icon: cat.icon,
+                            color: cat.color,
+                            budget_group: cat.budget_group,
+                            isSystemDefault: true, // Mark as system default
+                          }
+                        );
+
+                        if (result.success) {
+                          console.log(`✅ Added default category: ${cat.name}`);
+                          // Sync to Firebase
+                          if (result.category) {
+                            CategoryService.syncCategoryToFirebase(
+                              userId,
+                              result.category.id
+                            )
+                              .then((syncResult) => {
+                                if (syncResult.synced) {
+                                  console.log(
+                                    `✅ Synced default category to Firebase: ${cat.name}`
+                                  );
+                                } else {
+                                  console.warn(
+                                    `⚠️ Failed to sync: ${syncResult.message}`
+                                  );
+                                }
+                              })
+                              .catch((error) => {
+                                console.warn(
+                                  "⚠️ Error syncing default category:",
+                                  error
+                                );
+                              });
+                          }
+                          // Reload categories
+                          loadCategoriesFromSQLite();
+                          Alert.alert(
+                            "Thành công",
+                            `Đã thêm danh mục "${cat.name}" vào danh mục của bạn.`
+                          );
+                        } else {
+                          Alert.alert("Thông báo", result.message);
+                        }
+                      }
+                    }
+                  }}
                 >
-                  <Icon name={cat.icon} size={20} color="#fff" />
-                </View>
-                <Text style={styles.categoryName}>{cat.name}</Text>
-                {cat.is_system_default === 1 && (
-                  <Icon
-                    name="star"
-                    size={14}
-                    color="#FFD700"
-                    style={{ marginLeft: 4 }}
-                  />
-                )}
-              </View>
-            ))}
+                  <View
+                    style={[
+                      styles.categoryIcon,
+                      { backgroundColor: cat.color || "#2196F3" },
+                    ]}
+                  >
+                    <Icon name={cat.icon || "tag"} size={20} color="#fff" />
+                  </View>
+                  <Text style={styles.categoryName}>{cat.name}</Text>
+                  {isDefault && (
+                    <Icon
+                      name="star"
+                      size={14}
+                      color="#FFD700"
+                      style={{ marginLeft: 4 }}
+                    />
+                  )}
+                  {!isDefault && (
+                    <TouchableOpacity
+                      onPress={async (e) => {
+                        e.stopPropagation();
+                        // Handle delete user category
+                        if (userId) {
+                          Alert.alert(
+                            "Xóa danh mục",
+                            `Bạn có chắc chắn muốn xóa danh mục "${cat.name}"?`,
+                            [
+                              { text: "Hủy", style: "cancel" },
+                              {
+                                text: "Xóa",
+                                style: "destructive",
+                                onPress: async () => {
+                                  const CategoryService = (
+                                    await import("./services/categoryService")
+                                  ).default;
+                                  const result =
+                                    await CategoryService.deleteCategory(
+                                      userId,
+                                      cat.id
+                                    );
+                                  if (result.success) {
+                                    Alert.alert("Thành công", result.message);
+                                    loadCategoriesFromSQLite();
+                                  } else {
+                                    Alert.alert("Lỗi", result.message);
+                                  }
+                                },
+                              },
+                            ]
+                          );
+                        }
+                      }}
+                      style={{ marginLeft: 4 }}
+                    >
+                      <Icon name="close-circle" size={14} color="#FF6B6B" />
+                    </TouchableOpacity>
+                  )}
+                </TouchableOpacity>
+              );
+            })}
           </ScrollView>
         ) : (
-          // Hiển thị text này nếu không có category
-          <Text style={styles.emptyCategoryText}>Chưa có phân loại nào.</Text>
+          <Text style={styles.emptyCategoryText}>
+            Chưa có phân loại nào cho nhóm {selectedBudgetGroup}.
+          </Text>
         )}
       </View>
 
@@ -465,15 +1067,17 @@ const CategoryManagementScreen = () => {
 
       <View style={styles.divider} />
 
-      <Text style={styles.sectionTitle}>Chọn biểu tượng</Text>
-      <FlatList
-        data={iconList}
-        renderItem={renderIconItem}
-        keyExtractor={(item) => item}
-        numColumns={5}
-        contentContainerStyle={styles.iconGrid}
-        showsVerticalScrollIndicator={false}
-      />
+      <View style={styles.iconSection}>
+        <Text style={styles.sectionTitle}>Chọn biểu tượng</Text>
+        <FlatList
+          data={iconList}
+          renderItem={renderIconItem}
+          keyExtractor={(item) => item}
+          numColumns={5}
+          contentContainerStyle={styles.iconGrid}
+          showsVerticalScrollIndicator={false}
+        />
+      </View>
     </View>
   );
 };
@@ -641,6 +1245,62 @@ const styles = StyleSheet.create({
     height: 8,
     backgroundColor: "#F5F5F5",
   },
+  budgetGroupSection: {
+    backgroundColor: "#fff",
+    paddingVertical: 16,
+    paddingHorizontal: 16,
+    marginTop: 8,
+  },
+  budgetGroupContainer: {
+    flexDirection: "row",
+    gap: 12,
+    marginTop: 8,
+  },
+  budgetGroupButton: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    backgroundColor: "#F5F5F5",
+    borderWidth: 2,
+    borderColor: "#E0E0E0",
+  },
+  budgetGroupButtonActive: {
+    backgroundColor: "#2196F3",
+    borderColor: "#2196F3",
+  },
+  budgetGroupButtonText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#666",
+  },
+  budgetGroupButtonTextActive: {
+    color: "#fff",
+  },
+  categoryCountBadge: {
+    backgroundColor: "rgba(0, 0, 0, 0.1)",
+    borderRadius: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    marginLeft: 6,
+    minWidth: 24,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  categoryCountBadgeActive: {
+    backgroundColor: "rgba(255, 255, 255, 0.3)",
+  },
+  categoryCountBadgeText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#666",
+  },
+  categoryCountBadgeTextActive: {
+    color: "#fff",
+  },
   iconGrid: {
     padding: 16,
   },
@@ -657,6 +1317,10 @@ const styles = StyleSheet.create({
     backgroundColor: "#E3F2FD",
     borderWidth: 2,
     borderColor: "#2196F3",
+  },
+  iconSection: {
+    backgroundColor: "#fff",
+    paddingBottom: 16,
   },
 });
 

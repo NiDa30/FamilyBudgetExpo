@@ -17,6 +17,7 @@ import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { Category, RootStackParamList } from "../App";
 // DÙNG THEME
 import { collection, onSnapshot, query, where } from "firebase/firestore";
+import { COLLECTIONS } from "./constants/collections";
 import { useTheme } from "./context/ThemeContext";
 import { CategoryRepository } from "./database/repositories";
 import { auth, db } from "./firebaseConfig";
@@ -76,7 +77,7 @@ const HomeScreen = () => {
 
       // Listen to transactions changes
       const transactionsQuery = query(
-        collection(db, "TRANSACTIONS"),
+        collection(db, COLLECTIONS.TRANSACTIONS),
         where("userID", "==", user.uid),
         where("isDeleted", "==", false)
       );
@@ -150,132 +151,231 @@ const HomeScreen = () => {
 
       // Listen to categories changes
       const categoriesQuery = query(
-        collection(db, "CATEGORIES"),
+        collection(db, COLLECTIONS.CATEGORIES),
         where("userID", "==", user.uid),
         where("isHidden", "==", false)
       );
 
+      // Debounce timer for category sync
+      let categorySyncTimeout: ReturnType<typeof setTimeout> | null = null;
+      let lastCategorySyncTime = 0;
+      const CATEGORY_SYNC_DEBOUNCE_MS = 2000; // 2 seconds debounce
+
       const unsubscribeCategories = onSnapshot(
         categoriesQuery,
         async (snapshot) => {
-          console.log(
-            `📋 Firebase categories updated: ${snapshot.docs.length} categories`
-          );
-
-          // Sync Firebase categories to SQLite
-          try {
-            const databaseServiceModule = await import(
-              "./database/databaseService"
-            );
-            const databaseService =
-              databaseServiceModule.default ||
-              databaseServiceModule.DatabaseService;
-
-            const CategoryRepository = (await import("./database/repositories"))
-              .CategoryRepository;
-            let currentSQLiteCategories = await CategoryRepository.listByUser(
-              user.uid
-            );
-
-            for (const doc of snapshot.docs) {
-              const data = doc.data();
-              try {
-                // Check if category exists in SQLite (check both current list and already synced in this batch)
-                const exists = currentSQLiteCategories.some(
-                  (c) => c.id === doc.id
-                );
-
-                if (!exists) {
-                  // Save new category to SQLite using INSERT OR REPLACE to avoid UNIQUE constraint errors
-                  try {
-                    await databaseService.createCategory({
-                      id: doc.id,
-                      user_id: data.userID || user.uid,
-                      name: data.name,
-                      type: data.type || "EXPENSE",
-                      icon: data.icon || "tag",
-                      color: data.color || "#2196F3",
-                      is_system_default: data.isSystemDefault ? 1 : 0,
-                      display_order: data.displayOrder || 0,
-                      is_hidden: data.isHidden ? 1 : 0,
-                    });
-                    await databaseService.markAsSynced("categories", doc.id);
-
-                    // ✅ UPDATE STATE: Add to currentSQLiteCategories to prevent duplicate syncs
-                    currentSQLiteCategories.push({
-                      id: doc.id,
-                      name: data.name,
-                      type: data.type || "EXPENSE",
-                      icon: data.icon || "tag",
-                      color: data.color || "#2196F3",
-                    } as any);
-
-                    console.log(`✅ Synced category ${data.name} to SQLite`);
-                  } catch (createError: any) {
-                    // If UNIQUE constraint error, try to update instead
-                    if (createError?.message?.includes("UNIQUE constraint")) {
-                      try {
-                        await databaseService.updateCategory(doc.id, {
-                          name: data.name,
-                          type: data.type || "EXPENSE",
-                          icon: data.icon || "tag",
-                          color: data.color || "#2196F3",
-                          is_system_default: data.isSystemDefault ? 1 : 0,
-                          display_order: data.displayOrder || 0,
-                          is_hidden: data.isHidden ? 1 : 0,
-                        });
-                        await databaseService.markAsSynced(
-                          "categories",
-                          doc.id
-                        );
-
-                        // ✅ UPDATE STATE: Add to currentSQLiteCategories to prevent duplicate syncs
-                        const alreadyExists = currentSQLiteCategories.some(
-                          (c) => c.id === doc.id
-                        );
-                        if (!alreadyExists) {
-                          currentSQLiteCategories.push({
-                            id: doc.id,
-                            name: data.name,
-                            type: data.type || "EXPENSE",
-                            icon: data.icon || "tag",
-                            color: data.color || "#2196F3",
-                          } as any);
-                        }
-
-                        console.log(
-                          `✅ Updated category ${data.name} in SQLite`
-                        );
-                      } catch (updateError) {
-                        // Suppress duplicate error logs
-                      }
-                    }
-                  }
-                }
-              } catch (syncError) {
-                // Suppress duplicate error logs for UNIQUE constraint errors
-                const errorMessage =
-                  syncError instanceof Error
-                    ? syncError.message
-                    : String(syncError);
-                if (!errorMessage.includes("UNIQUE constraint")) {
-                  console.warn(`Failed to sync category ${doc.id}:`, syncError);
-                }
-              }
-            }
-          } catch (syncError) {
-            console.warn("Failed to sync categories to SQLite:", syncError);
+          // Check if there are actual changes
+          const changes = snapshot.docChanges();
+          if (changes.length === 0) {
+            return; // No changes, skip sync
           }
 
-          // Reload categories when they change
-          await loadCategories();
+          const now = Date.now();
+          // Debounce: skip if synced too recently
+          if (now - lastCategorySyncTime < CATEGORY_SYNC_DEBOUNCE_MS) {
+            // Clear existing timeout and set a new one
+            if (categorySyncTimeout) {
+              clearTimeout(categorySyncTimeout);
+            }
+            categorySyncTimeout = setTimeout(async () => {
+              await handleCategorySync(snapshot, user.uid);
+              lastCategorySyncTime = Date.now();
+            }, CATEGORY_SYNC_DEBOUNCE_MS);
+            return;
+          }
+
+          lastCategorySyncTime = now;
+          await handleCategorySync(snapshot, user.uid);
         },
         (error) => {
           console.error("Firebase categories listener error:", error);
         }
       );
 
+      // Helper function to handle category sync
+      const handleCategorySync = async (snapshot: any, uid: string) => {
+        // Sync Firebase categories to SQLite
+        try {
+          const databaseServiceModule = await import(
+            "./database/databaseService"
+          );
+          const databaseService =
+            databaseServiceModule.default ||
+            databaseServiceModule.DatabaseService;
+
+          const CategoryRepository = (await import("./database/repositories"))
+            .CategoryRepository;
+          let currentSQLiteCategories = await CategoryRepository.listByUser(
+            uid
+          );
+
+          // Remove duplicates before syncing
+          try {
+            const removedCount =
+              await databaseService.removeDuplicateCategories(uid);
+            if (removedCount > 0) {
+              console.log(
+                `🧹 Removed ${removedCount} duplicate categories before sync`
+              );
+              currentSQLiteCategories = await CategoryRepository.listByUser(
+                uid
+              );
+            }
+          } catch (cleanupError) {
+            console.warn("Failed to remove duplicates:", cleanupError);
+          }
+
+          // Filter duplicates from Firebase data
+          const seen = new Set<string>();
+          const uniqueDocs = snapshot.docs.filter((doc: any) => {
+            const data = doc.data();
+            const key = `${data.userID || uid}_${data.name}_${
+              data.type || "EXPENSE"
+            }`;
+            if (seen.has(key)) {
+              return false;
+            }
+            seen.add(key);
+            return true;
+          });
+
+          if (uniqueDocs.length !== snapshot.docs.length) {
+            console.log(
+              `🔄 Filtered ${
+                snapshot.docs.length - uniqueDocs.length
+              } duplicate categories from Firebase`
+            );
+          }
+
+          // Batch sync categories to reduce logs
+          let syncedCount = 0;
+          let updatedCount = 0;
+          let skippedCount = 0;
+
+          for (const doc of uniqueDocs) {
+            const data = doc.data();
+            try {
+              // Check if category exists by name+type (not just ID)
+              const existingByName = await databaseService.categoryExistsByName(
+                data.userID || uid,
+                data.name,
+                data.type || "EXPENSE"
+              );
+
+              const existsById = currentSQLiteCategories.some(
+                (c) => c.id === doc.id
+              );
+
+              if (!existingByName && !existsById) {
+                // Save new category to SQLite using INSERT OR REPLACE to avoid UNIQUE constraint errors
+                try {
+                  await databaseService.createCategory({
+                    id: doc.id,
+                    user_id: data.userID || uid,
+                    name: data.name,
+                    type: data.type || "EXPENSE",
+                    icon: data.icon || "tag",
+                    color: data.color || "#2196F3",
+                    is_system_default: data.isSystemDefault ? 1 : 0,
+                    display_order: data.displayOrder || 0,
+                    is_hidden: data.isHidden ? 1 : 0,
+                  });
+                  await databaseService.markAsSynced("categories", doc.id);
+
+                  // ✅ UPDATE STATE: Add to currentSQLiteCategories to prevent duplicate syncs
+                  currentSQLiteCategories.push({
+                    id: doc.id,
+                    name: data.name,
+                    type: data.type || "EXPENSE",
+                    icon: data.icon || "tag",
+                    color: data.color || "#2196F3",
+                  } as any);
+
+                  syncedCount++;
+                } catch (createError: any) {
+                  // If UNIQUE constraint error, try to update instead
+                  if (createError?.message?.includes("UNIQUE constraint")) {
+                    try {
+                      await databaseService.updateCategory(doc.id, {
+                        name: data.name,
+                        type: data.type || "EXPENSE",
+                        icon: data.icon || "tag",
+                        color: data.color || "#2196F3",
+                        is_system_default: data.isSystemDefault ? 1 : 0,
+                        display_order: data.displayOrder || 0,
+                        is_hidden: data.isHidden ? 1 : 0,
+                      });
+                      await databaseService.markAsSynced("categories", doc.id);
+
+                      // ✅ UPDATE STATE: Add to currentSQLiteCategories to prevent duplicate syncs
+                      const alreadyExists = currentSQLiteCategories.some(
+                        (c) => c.id === doc.id
+                      );
+                      if (!alreadyExists) {
+                        currentSQLiteCategories.push({
+                          id: doc.id,
+                          name: data.name,
+                          type: data.type || "EXPENSE",
+                          icon: data.icon || "tag",
+                          color: data.color || "#2196F3",
+                        } as any);
+                      }
+
+                      updatedCount++;
+                    } catch (updateError) {
+                      // Suppress duplicate error logs
+                    }
+                  }
+                }
+              } else {
+                skippedCount++;
+              }
+            } catch (syncError) {
+              // Suppress duplicate error logs for UNIQUE constraint errors
+              const errorMessage =
+                syncError instanceof Error
+                  ? syncError.message
+                  : String(syncError);
+              if (!errorMessage.includes("UNIQUE constraint")) {
+                console.warn(`Failed to sync category ${doc.id}:`, syncError);
+              }
+            }
+          }
+
+          // Remove duplicates after syncing
+          try {
+            const removedCount =
+              await databaseService.removeDuplicateCategories(uid);
+            if (removedCount > 0) {
+              console.log(
+                `🧹 Removed ${removedCount} duplicate categories after sync`
+              );
+            }
+          } catch (cleanupError) {
+            console.warn(
+              "Failed to remove duplicates after sync:",
+              cleanupError
+            );
+          }
+
+          // Log batch sync results only if there were changes
+          if (syncedCount > 0 || updatedCount > 0) {
+            console.log(
+              `📋 Categories synced: ${syncedCount} new, ${updatedCount} updated, ${skippedCount} skipped`
+            );
+          }
+        } catch (syncError) {
+          console.warn("Failed to sync categories to SQLite:", syncError);
+        }
+
+        // Reload categories when they change
+        await loadCategories();
+      };
+
       return () => {
+        if (categorySyncTimeout) {
+          clearTimeout(categorySyncTimeout);
+        }
         unsubscribeTransactions();
         unsubscribeCategories();
       };

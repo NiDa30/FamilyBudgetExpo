@@ -165,11 +165,41 @@ class SyncEngine {
       } else {
         console.log(`📊 Pushing ${unsyncedCategories.length} categories`);
 
+        // ✅ TỐI ƯU: LẤY DANH SÁCH FIREBASE CATEGORIES MỘT LẦN ĐỂ KIỂM TRA TRÙNG
+        let firebaseCategories = [];
+        try {
+          firebaseCategories = await FirebaseService.getCategories(userId);
+          console.log(`📋 Loaded ${firebaseCategories.length} categories from Firebase for duplicate check`);
+        } catch (error) {
+          console.warn("⚠️ Failed to load Firebase categories for duplicate check:", error);
+          // Continue without duplicate check if Firebase is unavailable
+        }
+
         for (const category of unsyncedCategories) {
           try {
             if (category.deleted_at) {
               await FirebaseService.deleteCategory(category.id);
             } else {
+              // ✅ KIỂM TRA TRÙNG TÊN TRONG FIREBASE TRƯỚC KHI ĐỒNG BỘ
+              if (firebaseCategories.length > 0) {
+                const duplicateInFirebase = firebaseCategories.find(
+                  (cat) =>
+                    cat.name.toLowerCase() === category.name.toLowerCase() &&
+                    (cat.type || "EXPENSE") === (category.type || "EXPENSE") &&
+                    !cat.isHidden &&
+                    cat.id !== category.id // Không tính chính nó
+                );
+
+                if (duplicateInFirebase) {
+                  console.warn(
+                    `⚠️ Category "${category.name}" (${category.type || "EXPENSE"}) already exists in Firebase with ID ${duplicateInFirebase.id}. Skipping sync.`
+                  );
+                  // Đánh dấu là đã đồng bộ để tránh thử lại
+                  await DatabaseService.markAsSynced("categories", category.id);
+                  continue;
+                }
+              }
+
               await FirebaseService.addCategory(userId, {
                 id: category.id,
                 name: category.name,
@@ -186,6 +216,19 @@ class SyncEngine {
             console.log(`✓ Pushed: ${category.name}`);
           } catch (error) {
             console.error(`❌ Failed: ${category.name}`, error);
+            
+            // Nếu lỗi là do trùng tên, đánh dấu là đã đồng bộ để tránh thử lại
+            const errorMessage = error?.message || String(error);
+            if (
+              errorMessage.includes("already exists") ||
+              errorMessage.includes("duplicate") ||
+              errorMessage.includes("UNIQUE")
+            ) {
+              console.warn(
+                `⚠️ Category "${category.name}" appears to be a duplicate in Firebase. Marking as synced.`
+              );
+              await DatabaseService.markAsSynced("categories", category.id);
+            }
           }
         }
       }

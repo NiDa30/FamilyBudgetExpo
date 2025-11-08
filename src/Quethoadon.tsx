@@ -24,6 +24,7 @@ import {
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { RootStackParamList } from "../App";
+import { COLLECTIONS } from "./constants/collections";
 import { CategoryRepository } from "./database/repositories";
 import { Category, Transaction, TransactionType } from "./domain/types";
 import { auth, db } from "./firebaseConfig";
@@ -313,7 +314,7 @@ const Quethoadon = () => {
 
         // 🔄 BƯỚC 2: SETUP FIREBASE REALTIME LISTENER
         const categoriesQuery = query(
-          collection(db, "CATEGORIES"),
+          collection(db, COLLECTIONS.CATEGORIES),
           where("userID", "==", user.uid)
         );
 
@@ -354,14 +355,66 @@ const Quethoadon = () => {
                 let currentSQLiteCategories =
                   await CategoryRepository.listByUser(user.uid);
 
+                // Remove duplicates before syncing
+                try {
+                  const removedCount =
+                    await databaseService.removeDuplicateCategories(user.uid);
+                  if (removedCount > 0) {
+                    console.log(
+                      `🧹 Removed ${removedCount} duplicate categories before sync`
+                    );
+                    // Reload categories after removing duplicates
+                    currentSQLiteCategories =
+                      await CategoryRepository.listByUser(user.uid);
+                  }
+                } catch (cleanupError) {
+                  console.warn("Failed to remove duplicates:", cleanupError);
+                }
+
+                // Filter out duplicates from Firebase data (by name+type)
+                const uniqueFirebaseCategories = [];
+                const seen = new Set<string>();
+
                 for (const category of firebaseCategories) {
+                  const key = `${category.userId || user.uid}_${
+                    category.name
+                  }_${category.type || "EXPENSE"}`;
+                  if (!seen.has(key)) {
+                    seen.add(key);
+                    uniqueFirebaseCategories.push(category);
+                  }
+                }
+
+                if (
+                  uniqueFirebaseCategories.length !== firebaseCategories.length
+                ) {
+                  console.log(
+                    `🔄 Filtered ${
+                      firebaseCategories.length -
+                      uniqueFirebaseCategories.length
+                    } duplicate categories from Firebase`
+                  );
+                }
+
+                // Batch sync categories to reduce logs
+                let syncedCount = 0;
+                let skippedCount = 0;
+
+                for (const category of uniqueFirebaseCategories) {
                   try {
-                    // Check if category exists in SQLite (check both current list and already synced in this batch)
-                    const exists = currentSQLiteCategories.some(
+                    // Check if category exists in SQLite by name+type (not just ID)
+                    const existingByName =
+                      await databaseService.categoryExistsByName(
+                        category.userId || user.uid,
+                        category.name,
+                        category.type || "EXPENSE"
+                      );
+
+                    const existsById = currentSQLiteCategories.some(
                       (c) => c.id === category.id
                     );
 
-                    if (!exists) {
+                    if (!existingByName && !existsById) {
                       // Save new category to SQLite
                       await databaseService.createCategory({
                         id: category.id,
@@ -384,9 +437,9 @@ const Quethoadon = () => {
                         color: category.color || "#2196F3",
                       } as any);
 
-                      console.log(
-                        `✅ Saved category to SQLite: ${category.name} (type: ${category.type})`
-                      );
+                      syncedCount++;
+                    } else {
+                      skippedCount++;
                     }
                   } catch (catError: any) {
                     // Suppress duplicate error logs for UNIQUE constraint errors
@@ -400,6 +453,29 @@ const Quethoadon = () => {
                   }
                 }
 
+                // Remove duplicates again after syncing
+                try {
+                  const removedCount =
+                    await databaseService.removeDuplicateCategories(user.uid);
+                  if (removedCount > 0) {
+                    console.log(
+                      `🧹 Removed ${removedCount} duplicate categories after sync`
+                    );
+                  }
+                } catch (cleanupError) {
+                  console.warn(
+                    "Failed to remove duplicates after sync:",
+                    cleanupError
+                  );
+                }
+
+                // Log batch sync results
+                if (syncedCount > 0 || skippedCount > 0) {
+                  console.log(
+                    `📋 Firebase categories updated: ${uniqueFirebaseCategories.length} unique categories (${syncedCount} synced, ${skippedCount} skipped)`
+                  );
+                }
+
                 // 🔄 BƯỚC 4: RELOAD FROM SQLITE AFTER SYNC
                 const updatedCategories = await CategoryRepository.listByUser(
                   user.uid
@@ -411,19 +487,16 @@ const Quethoadon = () => {
                     JSON.stringify(updatedCategories) !==
                     JSON.stringify(prevCategories)
                   ) {
-                    console.log(
-                      `🔄 Updated ${updatedCategories.length} categories from Firebase sync`
-                    );
                     return updatedCategories;
                   } else {
-                    console.log("✓ No category changes from Firebase");
                     return prevCategories;
                   }
                 });
 
-                // Trigger full sync to ensure everything is synchronized
-                SyncEngine.scheduleSync(user.uid, 1000);
-                console.log("✅ Categories synced to SQLite");
+                // Only schedule sync if there were actual changes
+                if (syncedCount > 0) {
+                  SyncEngine.scheduleSync(user.uid, 5000); // Increased delay to reduce sync frequency
+                }
               } catch (error) {
                 console.warn("Background sync failed:", error);
               }
@@ -476,7 +549,8 @@ const Quethoadon = () => {
 
     // Listen to user's transactions for real-time updates
     const transactionsQuery = query(
-      collection(db, `users/${user.uid}/transactions`),
+      collection(db, COLLECTIONS.TRANSACTIONS),
+      where("userID", "==", user.uid),
       where("isDeleted", "==", false)
     );
 
@@ -1128,11 +1202,32 @@ const Quethoadon = () => {
 
       // Step 2: Trigger immediate sync to Firebase
       try {
-        await SyncEngine.performSync(userId, true);
+        console.log("🔄 Pushing transaction to Firebase immediately...");
+        // Push transaction to Firebase directly
+        const FirebaseService = (
+          await import("./service/firebase/FirebaseService")
+        ).default;
+        await FirebaseService.addTransaction(userId, {
+          id: transactionId,
+          category_id: categoryId,
+          amount: data.total,
+          type: "EXPENSE",
+          date: transactionDate,
+          description: itemsSummary,
+          payment_method: data.method,
+          merchant_name: data.store,
+          location_lat: null,
+          location_lng: null,
+        });
+
+        // Mark as synced in SQLite
+        const DatabaseService = (await import("./database/databaseService"))
+          .default;
+        await DatabaseService.markAsSynced("transactions", transactionId);
         console.log("✅ Transaction synced to Firebase:", transactionId);
       } catch (syncError) {
         console.warn(
-          "⚠️ Background sync failed, but transaction saved locally:",
+          "⚠️ Failed to sync transaction to Firebase, but transaction saved locally:",
           syncError
         );
         // Transaction is still saved locally and will sync later
@@ -1141,7 +1236,8 @@ const Quethoadon = () => {
       // Step 3: Setup real-time listener for this transaction to confirm sync
       const transactionDocRef = doc(
         db,
-        `users/${userId}/transactions/${transactionId}`
+        COLLECTIONS.TRANSACTIONS,
+        transactionId
       );
       const unsubscribe = onSnapshot(
         transactionDocRef,

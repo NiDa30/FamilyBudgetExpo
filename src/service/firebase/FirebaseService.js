@@ -12,18 +12,19 @@ import {
   writeBatch,
 } from "firebase/firestore";
 import { dbInstance as db } from "../../firebaseConfig";
+import { COLLECTIONS } from "../../constants/collections";
 
 class FirebaseService {
   // ==================== USER ====================
 
   async getUser(userId) {
-    const docRef = doc(db, "USERS", userId);
+    const docRef = doc(db, COLLECTIONS.USER, userId);
     const docSnap = await getDoc(docRef);
     return docSnap.exists() ? { id: docSnap.id, ...docSnap.data() } : null;
   }
 
   async updateUser(userId, data) {
-    const docRef = doc(db, "USERS", userId);
+    const docRef = doc(db, COLLECTIONS.USER, userId);
     await updateDoc(docRef, {
       ...data,
       updatedAt: Timestamp.now(),
@@ -34,7 +35,7 @@ class FirebaseService {
 
   async getCategories(userId) {
     const q = query(
-      collection(db, "CATEGORIES"),
+      collection(db, COLLECTIONS.CATEGORIES),
       where("userID", "==", userId),
       where("isHidden", "==", false)
     );
@@ -46,8 +47,41 @@ class FirebaseService {
     }));
   }
 
+  // ✅ NEW: Get default categories from CATEGORIES_DEFAULT collection
+  async getDefaultCategories() {
+    try {
+      console.log(`📋 Loading default categories from Firebase collection: ${COLLECTIONS.CATEGORIES_DEFAULT}`);
+      
+      const q = query(
+        collection(db, COLLECTIONS.CATEGORIES_DEFAULT),
+        where("isHidden", "==", false)
+      );
+      const snapshot = await getDocs(q);
+      
+      console.log(`📋 Found ${snapshot.docs.length} documents in CATEGORIES_DEFAULT collection`);
+      
+      const categories = snapshot.docs.map((doc) => {
+        const data = doc.data();
+        console.log(`📋 Default category: ${data.name} (${data.type || "EXPENSE"})`);
+        return {
+          id: doc.id,
+          ...data,
+          createdAt: data.createdAt?.toMillis(),
+          updatedAt: data.updatedAt?.toMillis(),
+        };
+      });
+      
+      console.log(`✅ Loaded ${categories.length} default categories from Firebase`);
+      return categories;
+    } catch (error) {
+      console.error("❌ Error loading default categories from Firebase:", error);
+      console.error("❌ Error details:", error.message, error.code);
+      return [];
+    }
+  }
+
   async addCategory(userId, category) {
-    const docRef = await addDoc(collection(db, "CATEGORIES"), {
+    const docRef = await addDoc(collection(db, COLLECTIONS.CATEGORIES), {
       categoryID: category.id,
       userID: userId,
       name: category.name,
@@ -64,12 +98,12 @@ class FirebaseService {
   }
 
   async updateCategory(categoryId, updates) {
-    const docRef = doc(db, "CATEGORIES", categoryId);
+    const docRef = doc(db, COLLECTIONS.CATEGORIES, categoryId);
     await updateDoc(docRef, updates);
   }
 
   async deleteCategory(categoryId) {
-    const docRef = doc(db, "CATEGORIES", categoryId);
+    const docRef = doc(db, COLLECTIONS.CATEGORIES, categoryId);
     await updateDoc(docRef, { isHidden: true });
   }
 
@@ -77,7 +111,7 @@ class FirebaseService {
 
   async getTransactions(userId, filters = {}) {
     let q = query(
-      collection(db, "TRANSACTIONS"),
+      collection(db, COLLECTIONS.TRANSACTIONS),
       where("userID", "==", userId),
       where("isDeleted", "==", false)
     );
@@ -142,14 +176,14 @@ class FirebaseService {
     }
 
     const docRef = await addDoc(
-      collection(db, "TRANSACTIONS"),
+      collection(db, COLLECTIONS.TRANSACTIONS),
       transactionData
     );
     return docRef.id;
   }
 
   async updateTransaction(transactionId, updates) {
-    const docRef = doc(db, "TRANSACTIONS", transactionId);
+    const docRef = doc(db, COLLECTIONS.TRANSACTIONS, transactionId);
     await updateDoc(docRef, {
       ...updates,
       lastModifiedAt: Timestamp.now(),
@@ -157,7 +191,7 @@ class FirebaseService {
   }
 
   async deleteTransaction(transactionId) {
-    const docRef = doc(db, "TRANSACTIONS", transactionId);
+    const docRef = doc(db, COLLECTIONS.TRANSACTIONS, transactionId);
     await updateDoc(docRef, {
       isDeleted: true,
       deletedAt: Timestamp.now(),
@@ -167,7 +201,7 @@ class FirebaseService {
   // ==================== BUDGETS ====================
 
   async getBudgets(userId) {
-    const q = query(collection(db, "BUDGETS"), where("userID", "==", userId));
+    const q = query(collection(db, COLLECTIONS.BUDGET), where("userID", "==", userId));
     const snapshot = await getDocs(q);
     return snapshot.docs.map((doc) => ({
       id: doc.id,
@@ -177,7 +211,7 @@ class FirebaseService {
   }
 
   async addBudget(userId, budget) {
-    const docRef = await addDoc(collection(db, "BUDGETS"), {
+    const docRef = await addDoc(collection(db, COLLECTIONS.BUDGET), {
       budgetID: budget.id,
       userID: userId,
       categoryID: budget.category_id,
@@ -194,7 +228,7 @@ class FirebaseService {
   // ==================== GOALS ====================
 
   async getGoals(userId) {
-    const q = query(collection(db, "GOALS"), where("userID", "==", userId));
+    const q = query(collection(db, COLLECTIONS.GOAL), where("userID", "==", userId));
     const snapshot = await getDocs(q);
     return snapshot.docs.map((doc) => ({
       id: doc.id,
@@ -206,7 +240,7 @@ class FirebaseService {
   }
 
   async addGoal(userId, goal) {
-    const docRef = await addDoc(collection(db, "GOALS"), {
+    const docRef = await addDoc(collection(db, COLLECTIONS.GOAL), {
       goalID: goal.id,
       userID: userId,
       name: goal.name,
@@ -226,7 +260,7 @@ class FirebaseService {
 
   async getPaymentMethods(userId) {
     const q = query(
-      collection(db, "PAYMENT_METHODS"),
+      collection(db, COLLECTIONS.PAYMENT_METHHOD),
       where("userID", "==", userId),
       where("isActive", "==", true)
     );
@@ -277,7 +311,7 @@ class FirebaseService {
   }
 
   async addSyncLog(userId, deviceId, syncData) {
-    await addDoc(collection(db, "SYNC_LOGS"), {
+    await addDoc(collection(db, COLLECTIONS.SYNC_LOG), {
       userID: userId,
       deviceID: deviceId,
       syncTime: Timestamp.now(),
@@ -290,17 +324,26 @@ class FirebaseService {
     });
   }
 
-  // Thêm vào FirebaseService.js
+  // Get category by ID from top-level collection
   async getCategoryById(userId, categoryId) {
-    const docRef = doc(db, `users/${userId}/categories/${categoryId}`);
+    const docRef = doc(db, COLLECTIONS.CATEGORIES, categoryId);
     const docSnap = await getDoc(docRef);
-    return docSnap.exists() ? docSnap.data() : null;
+    if (!docSnap.exists()) return null;
+    const data = docSnap.data();
+    // Verify it belongs to the user
+    if (data.userID !== userId) return null;
+    return { id: docSnap.id, ...data };
   }
 
+  // Get transaction by ID from top-level collection
   async getTransactionById(userId, transactionId) {
-    const docRef = doc(db, `users/${userId}/transactions/${transactionId}`);
+    const docRef = doc(db, COLLECTIONS.TRANSACTIONS, transactionId);
     const docSnap = await getDoc(docRef);
-    return docSnap.exists() ? docSnap.data() : null;
+    if (!docSnap.exists()) return null;
+    const data = docSnap.data();
+    // Verify it belongs to the user
+    if (data.userID !== userId) return null;
+    return { id: docSnap.id, ...data };
   }
 }
 

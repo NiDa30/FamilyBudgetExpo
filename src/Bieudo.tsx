@@ -26,6 +26,7 @@ import {
   GoalTracker,
 } from "./components/budget";
 import { BarChart, LineChart, PieChart } from "./components/charts";
+import { COLLECTIONS } from "./constants/collections";
 import { useTheme } from "./context/ThemeContext";
 import { auth, db } from "./firebaseConfig";
 import { AnalyticsService } from "./service/analytics/AnalyticsService";
@@ -233,7 +234,7 @@ const ChartScreen = () => {
 
       // Set up transaction listener
       const transactionsQuery = query(
-        collection(db, "TRANSACTIONS"),
+        collection(db, COLLECTIONS.TRANSACTIONS),
         where("userID", "==", user.uid),
         where("isDeleted", "==", false),
         orderBy("date", "desc")
@@ -301,7 +302,7 @@ const ChartScreen = () => {
 
       // Set up categories listener
       const categoriesQuery = query(
-        collection(db, "CATEGORIES"),
+        collection(db, COLLECTIONS.CATEGORIES),
         where("userID", "==", user.uid),
         where("isHidden", "==", false)
       );
@@ -328,14 +329,44 @@ const ChartScreen = () => {
               user.uid
             );
 
-            for (const doc of snapshot.docs) {
+            // Remove duplicates before syncing
+            try {
+              const removedCount = await databaseService.removeDuplicateCategories(user.uid);
+              if (removedCount > 0) {
+                console.log(`🧹 Removed ${removedCount} duplicate categories`);
+                currentSQLiteCategories = await CategoryRepository.listByUser(user.uid);
+              }
+            } catch (cleanupError) {
+              console.warn("Failed to remove duplicates:", cleanupError);
+            }
+
+            // Filter duplicates from Firebase
+            const seen = new Set<string>();
+            const uniqueDocs = snapshot.docs.filter((doc) => {
+              const data = doc.data();
+              const key = `${data.userID || user.uid}_${data.name}_${data.type || "EXPENSE"}`;
+              if (seen.has(key)) {
+                return false;
+              }
+              seen.add(key);
+              return true;
+            });
+
+            for (const doc of uniqueDocs) {
               const data = doc.data();
               try {
-                const exists = currentSQLiteCategories.some(
+                // Check by name+type, not just ID
+                const existingByName = await databaseService.categoryExistsByName(
+                  data.userID || user.uid,
+                  data.name,
+                  data.type || "EXPENSE"
+                );
+                
+                const existsById = currentSQLiteCategories.some(
                   (c) => c.id === doc.id
                 );
 
-                if (!exists) {
+                if (!existingByName && !existsById) {
                   try {
                     await databaseService.createCategory({
                       id: doc.id,
@@ -366,6 +397,13 @@ const ChartScreen = () => {
                 // Suppress duplicate error logs
               }
             }
+            
+            // Remove duplicates after syncing
+            try {
+              await databaseService.removeDuplicateCategories(user.uid);
+            } catch (cleanupError) {
+              console.warn("Failed to remove duplicates after sync:", cleanupError);
+            }
 
             // Reload data after syncing categories
             loadData();
@@ -380,7 +418,7 @@ const ChartScreen = () => {
 
       // Set up goals listener
       const goalsQuery = query(
-        collection(db, "GOALS"),
+        collection(db, COLLECTIONS.GOAL),
         where("userID", "==", user.uid),
         orderBy("createdAt", "desc")
       );
