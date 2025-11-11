@@ -19,6 +19,7 @@ export const COLLECTIONS = {
 
   // System
   SYNC_LOG: "SYNC_LOG",
+  LOGIN_HISTORY: "LOGIN_HISTORY", // Login history collection
   NOTIFICATION: "NOTIFICATION",
   DEVICE: "DEVICE",
 
