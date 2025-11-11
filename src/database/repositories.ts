@@ -15,12 +15,42 @@ import {
 let db: SQLite.SQLiteDatabase | null = null;
 let dbInitPromise: Promise<SQLite.SQLiteDatabase> | null = null;
 const errorLogCache = new Set<string>();
+let hasIsDeletedColumn: boolean | null = null;
 
 // エラーログを1回だけ表示するヘルパー関数
 function logErrorOnce(key: string, message: string, ...args: any[]) {
   if (!errorLogCache.has(key)) {
     errorLogCache.add(key);
     console.error(message, ...args);
+  }
+}
+
+// Check if is_deleted column exists in transactions table
+async function checkIsDeletedColumn(): Promise<boolean> {
+  if (hasIsDeletedColumn !== null) {
+    return hasIsDeletedColumn;
+  }
+
+  try {
+    const database = await getDb();
+    const tableInfo = await database.getAllAsync("PRAGMA table_info(transactions)");
+    hasIsDeletedColumn = tableInfo.some((col: any) => col.name === "is_deleted");
+    return hasIsDeletedColumn;
+  } catch (error) {
+    console.warn("Error checking is_deleted column:", error);
+    hasIsDeletedColumn = false;
+    return false;
+  }
+}
+
+// Get the appropriate WHERE clause for filtering deleted transactions
+async function getDeletedFilterClause(): Promise<string> {
+  const hasColumn = await checkIsDeletedColumn();
+  if (hasColumn) {
+    return "(is_deleted IS NULL OR is_deleted = 0)";
+  } else {
+    // Fallback to deleted_at if is_deleted doesn't exist
+    return "(deleted_at IS NULL)";
   }
 }
 
@@ -175,18 +205,38 @@ export const TransactionRepository = {
     range?: DateRange,
     paging?: Pagination
   ): Promise<Transaction[]> {
-    let sql =
-      "SELECT * FROM transactions WHERE user_id = ? AND (is_deleted IS NULL OR is_deleted = 0)";
-    const params: any[] = [userId];
-    if (range) {
-      sql += " AND date BETWEEN ? AND ?";
-      params.push(range.start, range.end);
+    try {
+      const deletedFilter = await getDeletedFilterClause();
+      let sql = `SELECT * FROM transactions WHERE user_id = ? AND ${deletedFilter}`;
+      const params: any[] = [userId];
+      if (range) {
+        sql += " AND date BETWEEN ? AND ?";
+        params.push(range.start, range.end);
+      }
+      sql += " ORDER BY date DESC";
+      if (paging?.limit) sql += ` LIMIT ${paging.limit}`;
+      if (paging?.offset) sql += ` OFFSET ${paging.offset}`;
+      const { rows } = await runAsync(sql, params);
+      return rows.map(mapRowToTransaction);
+    } catch (error: any) {
+      // Fallback if is_deleted column doesn't exist
+      if (error?.message?.includes("is_deleted") || error?.message?.includes("no such column")) {
+        hasIsDeletedColumn = false;
+        const deletedFilter = await getDeletedFilterClause();
+        let sql = `SELECT * FROM transactions WHERE user_id = ? AND ${deletedFilter}`;
+        const params: any[] = [userId];
+        if (range) {
+          sql += " AND date BETWEEN ? AND ?";
+          params.push(range.start, range.end);
+        }
+        sql += " ORDER BY date DESC";
+        if (paging?.limit) sql += ` LIMIT ${paging.limit}`;
+        if (paging?.offset) sql += ` OFFSET ${paging.offset}`;
+        const { rows } = await runAsync(sql, params);
+        return rows.map(mapRowToTransaction);
+      }
+      throw error;
     }
-    sql += " ORDER BY date DESC";
-    if (paging?.limit) sql += ` LIMIT ${paging.limit}`;
-    if (paging?.offset) sql += ` OFFSET ${paging.offset}`;
-    const { rows } = await runAsync(sql, params);
-    return rows.map(mapRowToTransaction);
   },
 
   async create(txn: Transaction): Promise<void> {
@@ -213,17 +263,61 @@ export const TransactionRepository = {
   },
 
   async softDelete(id: UUID): Promise<void> {
-    await runAsync(
-      "UPDATE transactions SET is_deleted = 1, deleted_at = ?, last_modified_at = ?, is_synced = 0 WHERE id = ?",
-      [new Date().toISOString(), new Date().toISOString(), id]
-    );
+    try {
+      const hasColumn = await checkIsDeletedColumn();
+      if (hasColumn) {
+        await runAsync(
+          "UPDATE transactions SET is_deleted = 1, deleted_at = ?, last_modified_at = ?, is_synced = 0 WHERE id = ?",
+          [new Date().toISOString(), new Date().toISOString(), id]
+        );
+      } else {
+        // Fallback: only use deleted_at
+        await runAsync(
+          "UPDATE transactions SET deleted_at = ?, last_modified_at = ?, is_synced = 0 WHERE id = ?",
+          [new Date().toISOString(), new Date().toISOString(), id]
+        );
+      }
+    } catch (error: any) {
+      if (error?.message?.includes("is_deleted") || error?.message?.includes("no such column")) {
+        hasIsDeletedColumn = false;
+        // Retry with deleted_at only
+        await runAsync(
+          "UPDATE transactions SET deleted_at = ?, last_modified_at = ?, is_synced = 0 WHERE id = ?",
+          [new Date().toISOString(), new Date().toISOString(), id]
+        );
+      } else {
+        throw error;
+      }
+    }
   },
 
   async restore(id: UUID): Promise<void> {
-    await runAsync(
-      "UPDATE transactions SET is_deleted = 0, deleted_at = NULL, last_modified_at = ?, is_synced = 0 WHERE id = ?",
-      [new Date().toISOString(), id]
-    );
+    try {
+      const hasColumn = await checkIsDeletedColumn();
+      if (hasColumn) {
+        await runAsync(
+          "UPDATE transactions SET is_deleted = 0, deleted_at = NULL, last_modified_at = ?, is_synced = 0 WHERE id = ?",
+          [new Date().toISOString(), id]
+        );
+      } else {
+        // Fallback: only use deleted_at
+        await runAsync(
+          "UPDATE transactions SET deleted_at = NULL, last_modified_at = ?, is_synced = 0 WHERE id = ?",
+          [new Date().toISOString(), id]
+        );
+      }
+    } catch (error: any) {
+      if (error?.message?.includes("is_deleted") || error?.message?.includes("no such column")) {
+        hasIsDeletedColumn = false;
+        // Retry with deleted_at only
+        await runAsync(
+          "UPDATE transactions SET deleted_at = NULL, last_modified_at = ?, is_synced = 0 WHERE id = ?",
+          [new Date().toISOString(), id]
+        );
+      } else {
+        throw error;
+      }
+    }
   },
 
   async hardDelete(id: UUID): Promise<void> {
@@ -244,51 +338,106 @@ export const TransactionRepository = {
       paging?: Pagination;
     }
   ): Promise<Transaction[]> {
-    const clauses: string[] = [
-      "user_id = ?",
-      "(is_deleted IS NULL OR is_deleted = 0)",
-    ];
-    const params: any[] = [userId];
+    try {
+      const deletedFilter = await getDeletedFilterClause();
+      const clauses: string[] = [
+        "user_id = ?",
+        deletedFilter,
+      ];
+      const params: any[] = [userId];
 
-    if (filters.range) {
-      clauses.push("date BETWEEN ? AND ?");
-      params.push(filters.range.start, filters.range.end);
-    }
-    if (filters.type) {
-      clauses.push("type = ?");
-      params.push(filters.type);
-    }
-    if (typeof filters.categoryId !== "undefined") {
-      if (filters.categoryId === null) {
-        clauses.push("category_id IS NULL");
-      } else {
-        clauses.push("category_id = ?");
-        params.push(filters.categoryId);
+      if (filters.range) {
+        clauses.push("date BETWEEN ? AND ?");
+        params.push(filters.range.start, filters.range.end);
       }
-    }
-    if (typeof filters.minAmount === "number") {
-      clauses.push("amount >= ?");
-      params.push(filters.minAmount);
-    }
-    if (typeof filters.maxAmount === "number") {
-      clauses.push("amount <= ?");
-      params.push(filters.maxAmount);
-    }
-    if (filters.search && filters.search.trim()) {
-      clauses.push("(description LIKE ? OR merchant_name LIKE ?)");
-      const pattern = `%${filters.search.trim()}%`;
-      params.push(pattern, pattern);
-    }
+      if (filters.type) {
+        clauses.push("type = ?");
+        params.push(filters.type);
+      }
+      if (typeof filters.categoryId !== "undefined") {
+        if (filters.categoryId === null) {
+          clauses.push("category_id IS NULL");
+        } else {
+          clauses.push("category_id = ?");
+          params.push(filters.categoryId);
+        }
+      }
+      if (typeof filters.minAmount === "number") {
+        clauses.push("amount >= ?");
+        params.push(filters.minAmount);
+      }
+      if (typeof filters.maxAmount === "number") {
+        clauses.push("amount <= ?");
+        params.push(filters.maxAmount);
+      }
+      if (filters.search && filters.search.trim()) {
+        clauses.push("(description LIKE ? OR merchant_name LIKE ?)");
+        const pattern = `%${filters.search.trim()}%`;
+        params.push(pattern, pattern);
+      }
 
-    let sql = `SELECT * FROM transactions WHERE ${clauses.join(" AND ")}`;
-    const sortBy = filters.sortBy || "date";
-    const sortDir = filters.sortDir || "DESC";
-    sql += ` ORDER BY ${sortBy} ${sortDir}`;
-    if (filters.paging?.limit) sql += ` LIMIT ${filters.paging.limit}`;
-    if (filters.paging?.offset) sql += ` OFFSET ${filters.paging.offset}`;
+      let sql = `SELECT * FROM transactions WHERE ${clauses.join(" AND ")}`;
+      const sortBy = filters.sortBy || "date";
+      const sortDir = filters.sortDir || "DESC";
+      sql += ` ORDER BY ${sortBy} ${sortDir}`;
+      if (filters.paging?.limit) sql += ` LIMIT ${filters.paging.limit}`;
+      if (filters.paging?.offset) sql += ` OFFSET ${filters.paging.offset}`;
 
-    const { rows } = await runAsync(sql, params);
-    return rows.map(mapRowToTransaction);
+      const { rows } = await runAsync(sql, params);
+      return rows.map(mapRowToTransaction);
+    } catch (error: any) {
+      // Fallback if is_deleted column doesn't exist
+      if (error?.message?.includes("is_deleted") || error?.message?.includes("no such column")) {
+        hasIsDeletedColumn = false;
+        const deletedFilter = await getDeletedFilterClause();
+        const clauses: string[] = [
+          "user_id = ?",
+          deletedFilter,
+        ];
+        const params: any[] = [userId];
+
+        if (filters.range) {
+          clauses.push("date BETWEEN ? AND ?");
+          params.push(filters.range.start, filters.range.end);
+        }
+        if (filters.type) {
+          clauses.push("type = ?");
+          params.push(filters.type);
+        }
+        if (typeof filters.categoryId !== "undefined") {
+          if (filters.categoryId === null) {
+            clauses.push("category_id IS NULL");
+          } else {
+            clauses.push("category_id = ?");
+            params.push(filters.categoryId);
+          }
+        }
+        if (typeof filters.minAmount === "number") {
+          clauses.push("amount >= ?");
+          params.push(filters.minAmount);
+        }
+        if (typeof filters.maxAmount === "number") {
+          clauses.push("amount <= ?");
+          params.push(filters.maxAmount);
+        }
+        if (filters.search && filters.search.trim()) {
+          clauses.push("(description LIKE ? OR merchant_name LIKE ?)");
+          const pattern = `%${filters.search.trim()}%`;
+          params.push(pattern, pattern);
+        }
+
+        let sql = `SELECT * FROM transactions WHERE ${clauses.join(" AND ")}`;
+        const sortBy = filters.sortBy || "date";
+        const sortDir = filters.sortDir || "DESC";
+        sql += ` ORDER BY ${sortBy} ${sortDir}`;
+        if (filters.paging?.limit) sql += ` LIMIT ${filters.paging.limit}`;
+        if (filters.paging?.offset) sql += ` OFFSET ${filters.paging.offset}`;
+
+        const { rows } = await runAsync(sql, params);
+        return rows.map(mapRowToTransaction);
+      }
+      throw error;
+    }
   },
 
   async markSynced(ids: UUID[], syncedAt: string): Promise<void> {
@@ -301,11 +450,26 @@ export const TransactionRepository = {
   },
 
   async getUnsynced(userId: UUID): Promise<Transaction[]> {
-    const { rows } = await runAsync(
-      "SELECT * FROM transactions WHERE user_id = ? AND (is_synced = 0 OR is_synced IS NULL) AND (is_deleted IS NULL OR is_deleted = 0)",
-      [userId]
-    );
-    return rows.map(mapRowToTransaction);
+    try {
+      const deletedFilter = await getDeletedFilterClause();
+      const { rows } = await runAsync(
+        `SELECT * FROM transactions WHERE user_id = ? AND (is_synced = 0 OR is_synced IS NULL) AND ${deletedFilter}`,
+        [userId]
+      );
+      return rows.map(mapRowToTransaction);
+    } catch (error: any) {
+      // Fallback if is_deleted column doesn't exist
+      if (error?.message?.includes("is_deleted") || error?.message?.includes("no such column")) {
+        hasIsDeletedColumn = false;
+        const deletedFilter = await getDeletedFilterClause();
+        const { rows } = await runAsync(
+          `SELECT * FROM transactions WHERE user_id = ? AND (is_synced = 0 OR is_synced IS NULL) AND ${deletedFilter}`,
+          [userId]
+        );
+        return rows.map(mapRowToTransaction);
+      }
+      throw error;
+    }
   },
 };
 

@@ -414,35 +414,79 @@ class DatabaseService {
   async getTransactionsByUser(userId, options = {}) {
     await this.ensureInitialized();
 
-    let query = `
-      SELECT t.*, c.name as category_name, c.icon as category_icon, c.color as category_color
-      FROM transactions t
-      LEFT JOIN categories c ON t.category_id = c.id
-      WHERE t.user_id = ? AND t.deleted_at IS NULL
-    `;
-    const params = [userId];
+    try {
+      // Check if is_deleted column exists
+      const tableInfo = await this.db.getAllAsync("PRAGMA table_info(transactions)");
+      const hasIsDeleted = tableInfo.some((col) => col.name === "is_deleted");
+      
+      let deletedFilter = "t.deleted_at IS NULL";
+      if (hasIsDeleted) {
+        deletedFilter = "(t.is_deleted IS NULL OR t.is_deleted = 0) AND t.deleted_at IS NULL";
+      }
 
-    if (options.startDate) {
-      query += " AND t.date >= ?";
-      params.push(options.startDate);
-    }
-    if (options.endDate) {
-      query += " AND t.date <= ?";
-      params.push(options.endDate);
-    }
-    if (options.type) {
-      query += " AND t.type = ?";
-      params.push(options.type);
-    }
-    // Add category filtering support
-    if (options.categoryId) {
-      query += " AND t.category_id = ?";
-      params.push(options.categoryId);
-    }
+      let query = `
+        SELECT t.*, c.name as category_name, c.icon as category_icon, c.color as category_color
+        FROM transactions t
+        LEFT JOIN categories c ON t.category_id = c.id
+        WHERE t.user_id = ? AND ${deletedFilter}
+      `;
+      const params = [userId];
 
-    query += " ORDER BY t.date DESC";
+      if (options.startDate) {
+        query += " AND t.date >= ?";
+        params.push(options.startDate);
+      }
+      if (options.endDate) {
+        query += " AND t.date <= ?";
+        params.push(options.endDate);
+      }
+      if (options.type) {
+        query += " AND t.type = ?";
+        params.push(options.type);
+      }
+      // Add category filtering support
+      if (options.categoryId) {
+        query += " AND t.category_id = ?";
+        params.push(options.categoryId);
+      }
 
-    return await this.db.getAllAsync(query, params);
+      query += " ORDER BY t.date DESC";
+
+      return await this.db.getAllAsync(query, params);
+    } catch (error) {
+      // Fallback if is_deleted column doesn't exist
+      if (error?.message?.includes("is_deleted") || error?.message?.includes("no such column")) {
+        let query = `
+          SELECT t.*, c.name as category_name, c.icon as category_icon, c.color as category_color
+          FROM transactions t
+          LEFT JOIN categories c ON t.category_id = c.id
+          WHERE t.user_id = ? AND t.deleted_at IS NULL
+        `;
+        const params = [userId];
+
+        if (options.startDate) {
+          query += " AND t.date >= ?";
+          params.push(options.startDate);
+        }
+        if (options.endDate) {
+          query += " AND t.date <= ?";
+          params.push(options.endDate);
+        }
+        if (options.type) {
+          query += " AND t.type = ?";
+          params.push(options.type);
+        }
+        if (options.categoryId) {
+          query += " AND t.category_id = ?";
+          params.push(options.categoryId);
+        }
+
+        query += " ORDER BY t.date DESC";
+
+        return await this.db.getAllAsync(query, params);
+      }
+      throw error;
+    }
   }
 
   async getTransactionById(transactionId) {

@@ -21,74 +21,134 @@ export const addMissingTransactionColumns = async (db) => {
   }
 
   try {
-    // Thêm updated_at nếu chưa có (để tương thích DB cũ)
+    // Use a transaction to avoid database locking issues
+    await db.execAsync("BEGIN TRANSACTION");
+    
     try {
-      await db.execAsync("ALTER TABLE transactions ADD COLUMN updated_at TEXT");
-      console.log("Added updated_at column to transactions table");
-    } catch (error) {
-      if (!error.message.includes("duplicate column name")) {
-        console.warn("Warning adding updated_at:", error.message);
-      }
-    }
-
-    // Đồng bộ dữ liệu: copy updated_at từ last_modified_at nếu cần
-    await db.execAsync(`
-      UPDATE transactions 
-      SET updated_at = last_modified_at 
-      WHERE updated_at IS NULL AND last_modified_at IS NOT NULL
-    `);
-
-    await db.execAsync(`
-      UPDATE transactions 
-      SET updated_at = created_at 
-      WHERE updated_at IS NULL AND created_at IS NOT NULL
-    `);
-
-    // Các cột khác
-    const columnsToAdd = [
-      {
-        name: "location_lat",
-        sql: "ALTER TABLE transactions ADD COLUMN location_lat REAL",
-      },
-      {
-        name: "location_lng",
-        sql: "ALTER TABLE transactions ADD COLUMN location_lng REAL",
-      },
-      {
-        name: "merchant_location",
-        sql: "ALTER TABLE transactions ADD COLUMN merchant_location TEXT",
-      },
-      {
-        name: "last_modified_at",
-        sql: "ALTER TABLE transactions ADD COLUMN last_modified_at TEXT",
-      },
-    ];
-
-    for (const col of columnsToAdd) {
+      // Thêm updated_at nếu chưa có (để tương thích DB cũ)
       try {
-        await db.execAsync(col.sql);
-        console.log(`Added ${col.name} column`);
+        await db.execAsync("ALTER TABLE transactions ADD COLUMN updated_at TEXT");
+        console.log("Added updated_at column to transactions table");
       } catch (error) {
-        if (!error.message.includes("duplicate column name")) {
-          console.warn(`Warning adding ${col.name}:`, error.message);
+        if (!error.message.includes("duplicate column name") && !error.message.includes("already exists")) {
+          console.warn("Warning adding updated_at:", error.message);
         }
       }
-    }
 
-    // Tạo index
-    try {
-      await db.execAsync(
-        "CREATE INDEX IF NOT EXISTS idx_transactions_last_modified ON transactions(last_modified_at)"
-      );
-      console.log("Created index on last_modified_at");
+      // Các cột khác
+      const columnsToAdd = [
+        {
+          name: "location_lat",
+          sql: "ALTER TABLE transactions ADD COLUMN location_lat REAL",
+        },
+        {
+          name: "location_lng",
+          sql: "ALTER TABLE transactions ADD COLUMN location_lng REAL",
+        },
+        {
+          name: "merchant_location",
+          sql: "ALTER TABLE transactions ADD COLUMN merchant_location TEXT",
+        },
+        {
+          name: "last_modified_at",
+          sql: "ALTER TABLE transactions ADD COLUMN last_modified_at TEXT",
+        },
+        {
+          name: "is_deleted",
+          sql: "ALTER TABLE transactions ADD COLUMN is_deleted BOOLEAN DEFAULT 0",
+        },
+        {
+          name: "deleted_at",
+          sql: "ALTER TABLE transactions ADD COLUMN deleted_at TEXT",
+        },
+      ];
+
+      for (const col of columnsToAdd) {
+        try {
+          await db.execAsync(col.sql);
+          console.log(`Added ${col.name} column`);
+        } catch (error) {
+          if (!error.message.includes("duplicate column name") && !error.message.includes("already exists")) {
+            console.warn(`Warning adding ${col.name}:`, error.message);
+          }
+        }
+      }
+
+      // Đồng bộ dữ liệu: copy updated_at từ last_modified_at nếu cần
+      try {
+        await db.execAsync(`
+          UPDATE transactions 
+          SET updated_at = last_modified_at 
+          WHERE updated_at IS NULL AND last_modified_at IS NOT NULL
+        `);
+      } catch (error) {
+        console.warn("Warning syncing updated_at from last_modified_at:", error.message);
+      }
+
+      try {
+        await db.execAsync(`
+          UPDATE transactions 
+          SET updated_at = created_at 
+          WHERE updated_at IS NULL AND created_at IS NOT NULL
+        `);
+      } catch (error) {
+        console.warn("Warning syncing updated_at from created_at:", error.message);
+      }
+
+      // Sync is_deleted with deleted_at
+      try {
+        await db.execAsync(`
+          UPDATE transactions 
+          SET is_deleted = 1 
+          WHERE deleted_at IS NOT NULL AND (is_deleted IS NULL OR is_deleted = 0)
+        `);
+      } catch (error) {
+        console.warn("Warning syncing is_deleted with deleted_at:", error.message);
+      }
+
+      // Tạo index
+      try {
+        await db.execAsync(
+          "CREATE INDEX IF NOT EXISTS idx_transactions_last_modified ON transactions(last_modified_at)"
+        );
+        console.log("Created index on last_modified_at");
+      } catch (error) {
+        console.warn("Warning creating index:", error.message);
+      }
+
+      await db.execAsync("COMMIT");
+      console.log("Transaction table schema check completed");
     } catch (error) {
-      console.warn("Warning creating index:", error.message);
+      await db.execAsync("ROLLBACK");
+      throw error;
     }
-
-    console.log("Transaction table schema check completed");
   } catch (error) {
-    console.error("Error adding missing transaction columns:", error);
-    throw error;
+    // If transaction fails, try without transaction for individual operations
+    if (error.message.includes("database is locked")) {
+      console.warn("Database locked during transaction, retrying without transaction...");
+      // Retry individual operations without transaction
+      try {
+        // Check if is_deleted column exists
+        const tableInfo = await db.getAllAsync("PRAGMA table_info(transactions)");
+        const hasIsDeleted = tableInfo.some(col => col.name === "is_deleted");
+        
+        if (!hasIsDeleted) {
+          try {
+            await db.execAsync("ALTER TABLE transactions ADD COLUMN is_deleted BOOLEAN DEFAULT 0");
+            console.log("Added is_deleted column (retry)");
+          } catch (retryError) {
+            if (!retryError.message.includes("duplicate column name") && !retryError.message.includes("already exists")) {
+              console.warn("Warning adding is_deleted (retry):", retryError.message);
+            }
+          }
+        }
+      } catch (retryError) {
+        console.error("Error in retry:", retryError);
+      }
+    } else {
+      console.error("Error adding missing transaction columns:", error);
+      throw error;
+    }
   }
 };
 
