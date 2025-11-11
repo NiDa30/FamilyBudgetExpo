@@ -2,6 +2,7 @@
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
+import { getStorage } from "firebase/storage";
 
 // ✅ CÁCH 2: Sử dụng process.env với prefix EXPO_PUBLIC_ (Không cần import @env)
 const firebaseConfig = {
@@ -27,9 +28,10 @@ const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
 // Khởi tạo dịch vụ
 const authInstance = getAuth(app);
 const dbInstance = getFirestore(app);
+const storageInstance = getStorage(app);
 
 // Xuất ra để dùng ở các file khác
-export { authInstance, dbInstance };
+export { authInstance, dbInstance, storageInstance };
 // Export với tên ngắn để tương thích với code cũ
-export { authInstance as auth, dbInstance as db };
+export { authInstance as auth, dbInstance as db, storageInstance as storage };
 export default app;

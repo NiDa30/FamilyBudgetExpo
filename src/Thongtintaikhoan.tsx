@@ -1,5 +1,5 @@
 // src/Thongtintaikhoan.tsx
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState } from "react";
 import {
   View,
   Text,
@@ -10,19 +10,22 @@ import {
   Alert,
   ActivityIndicator,
   TextInput,
-  Modal,
-} from 'react-native';
-import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
-import { useNavigation } from '@react-navigation/native';
-import { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { RootStackParamList } from '../App';
-import { useTheme } from './context/ThemeContext';
-import { auth } from './firebaseConfig';
-import { AuthService } from './service/auth/auth';
-import FirebaseService from './service/firebase/FirebaseService';
-import { signOut } from 'firebase/auth';
+} from "react-native";
+import Icon from "react-native-vector-icons/MaterialCommunityIcons";
+import { useNavigation } from "@react-navigation/native";
+import { NativeStackNavigationProp } from "@react-navigation/native-stack";
+import * as ImagePicker from "expo-image-picker";
+import { RootStackParamList } from "../App";
+import { useTheme } from "./context/ThemeContext";
+import { auth } from "./firebaseConfig";
+import { AuthService } from "./service/auth/auth";
+import FirebaseService from "./service/firebase/FirebaseService";
+import { signOut } from "firebase/auth";
 
-type ThongtintaikhoanNavigationProp = NativeStackNavigationProp<RootStackParamList, 'Thongtintaikhoan'>;
+type ThongtintaikhoanNavigationProp = NativeStackNavigationProp<
+  RootStackParamList,
+  "Thongtintaikhoan"
+>;
 
 interface UserInfo {
   name: string;
@@ -38,15 +41,17 @@ const Thongtintaikhoan = () => {
 
   const [loading, setLoading] = useState(true);
   const [userInfo, setUserInfo] = useState<UserInfo>({
-    name: '',
-    email: '',
-    phone: '',
-    joinDate: '',
+    name: "",
+    email: "",
+    phone: "",
+    joinDate: "",
   });
   const [isEditing, setIsEditing] = useState(false);
-  const [editName, setEditName] = useState('');
-  const [editPhone, setEditPhone] = useState('');
+  const [editName, setEditName] = useState("");
+  const [editPhone, setEditPhone] = useState("");
   const [saving, setSaving] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [localImageUri, setLocalImageUri] = useState<string | null>(null);
 
   // Lấy thông tin người dùng từ Firebase
   useEffect(() => {
@@ -57,39 +62,43 @@ const Thongtintaikhoan = () => {
     try {
       const user = auth.currentUser;
       if (!user) {
-        Alert.alert('Lỗi', 'Bạn chưa đăng nhập');
-        navigation.navigate('Login');
+        Alert.alert("Lỗi", "Bạn chưa đăng nhập");
+        navigation.navigate("Login");
         return;
       }
 
       // Lấy thông tin từ Auth
       const authData = {
-        name: user.displayName || '',
-        email: user.email || '',
+        name: user.displayName || "",
+        email: user.email || "",
         photoURL: user.photoURL || undefined,
       };
 
       // Lấy thông tin từ Firestore
       let firestoreData: any = {};
       try {
-        const userDoc = await FirebaseService.getUser(user.uid);
+        const userDoc: any = await FirebaseService.getUser(user.uid);
         if (userDoc) {
           firestoreData = {
-            phone: userDoc.phone || userDoc.phoneNumber || '',
+            phone: userDoc.phone || userDoc.phoneNumber || "",
             joinDate: userDoc.createdAt
-              ? new Date(userDoc.createdAt.toMillis?.() || userDoc.createdAt).toLocaleDateString('vi-VN')
+              ? new Date(
+                  userDoc.createdAt.toMillis?.() || userDoc.createdAt
+                ).toLocaleDateString("vi-VN")
               : user.metadata.creationTime
-              ? new Date(user.metadata.creationTime).toLocaleDateString('vi-VN')
-              : '',
+              ? new Date(user.metadata.creationTime).toLocaleDateString("vi-VN")
+              : "",
           };
         }
       } catch (error) {
-        console.log('Không tìm thấy thông tin trong Firestore, sử dụng thông tin mặc định');
+        console.log(
+          "Không tìm thấy thông tin trong Firestore, sử dụng thông tin mặc định"
+        );
         firestoreData = {
-          phone: '',
+          phone: "",
           joinDate: user.metadata.creationTime
-            ? new Date(user.metadata.creationTime).toLocaleDateString('vi-VN')
-            : '',
+            ? new Date(user.metadata.creationTime).toLocaleDateString("vi-VN")
+            : "",
         };
       }
 
@@ -98,18 +107,84 @@ const Thongtintaikhoan = () => {
         ...firestoreData,
       });
       setEditName(authData.name);
-      setEditPhone(firestoreData.phone || '');
+      setEditPhone(firestoreData.phone || "");
     } catch (error) {
-      console.error('Lỗi khi tải thông tin người dùng:', error);
-      Alert.alert('Lỗi', 'Không thể tải thông tin người dùng');
+      console.error("Lỗi khi tải thông tin người dùng:", error);
+      Alert.alert("Lỗi", "Không thể tải thông tin người dùng");
     } finally {
       setLoading(false);
     }
   };
 
+  const handlePickImage = async () => {
+    try {
+      // Request permissions
+      const { status } =
+        await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== "granted") {
+        Alert.alert(
+          "Quyền truy cập",
+          "Cần quyền truy cập thư viện ảnh để thêm ảnh đại diện"
+        );
+        return;
+      }
+
+      // Show options
+      Alert.alert("Chọn ảnh đại diện", "Bạn muốn chọn ảnh từ đâu?", [
+        {
+          text: "Thư viện ảnh",
+          onPress: async () => {
+            const result = await ImagePicker.launchImageLibraryAsync({
+              mediaTypes: ImagePicker.MediaTypeOptions.Images,
+              allowsEditing: true,
+              aspect: [1, 1],
+              quality: 0.8,
+            });
+
+            if (!result.canceled && result.assets[0]) {
+              const imageUri = result.assets[0].uri;
+              setLocalImageUri(imageUri);
+              setUserInfo({ ...userInfo, photoURL: imageUri });
+            }
+          },
+        },
+        {
+          text: "Chụp ảnh",
+          onPress: async () => {
+            const { status: cameraStatus } =
+              await ImagePicker.requestCameraPermissionsAsync();
+            if (cameraStatus !== "granted") {
+              Alert.alert(
+                "Quyền truy cập",
+                "Cần quyền truy cập camera để chụp ảnh"
+              );
+              return;
+            }
+
+            const result = await ImagePicker.launchCameraAsync({
+              allowsEditing: true,
+              aspect: [1, 1],
+              quality: 0.8,
+            });
+
+            if (!result.canceled && result.assets[0]) {
+              const imageUri = result.assets[0].uri;
+              setLocalImageUri(imageUri);
+              setUserInfo({ ...userInfo, photoURL: imageUri });
+            }
+          },
+        },
+        { text: "Hủy", style: "cancel" },
+      ]);
+    } catch (error: any) {
+      console.error("Lỗi khi chọn ảnh:", error);
+      Alert.alert("Lỗi", "Không thể chọn ảnh");
+    }
+  };
+
   const handleSave = async () => {
     if (!editName.trim()) {
-      Alert.alert('Lỗi', 'Vui lòng nhập tên');
+      Alert.alert("Lỗi", "Vui lòng nhập tên");
       return;
     }
 
@@ -117,63 +192,75 @@ const Thongtintaikhoan = () => {
     try {
       const user = auth.currentUser;
       if (!user) {
-        Alert.alert('Lỗi', 'Bạn chưa đăng nhập');
+        Alert.alert("Lỗi", "Bạn chưa đăng nhập");
         return;
       }
 
-      // Cập nhật Auth profile
-      await AuthService.updateUserProfile({
+      // Prepare profile updates
+      const profileUpdates: any = {
         displayName: editName.trim(),
-      });
+      };
 
-      // Cập nhật Firestore
+      // If there's a local image, we'll use it (in production, upload to Firebase Storage)
+      if (localImageUri) {
+        profileUpdates.photoURL = localImageUri;
+      } else if (userInfo.photoURL) {
+        profileUpdates.photoURL = userInfo.photoURL;
+      }
+
+      // Cập nhật Auth profile
+      await AuthService.updateUserProfile(profileUpdates);
+
+      // Cập nhật Firestore (will create if doesn't exist)
       await FirebaseService.updateUser(user.uid, {
         name: editName.trim(),
         phone: editPhone.trim(),
+        photoURL: profileUpdates.photoURL || userInfo.photoURL || null,
       });
 
       setUserInfo({
         ...userInfo,
         name: editName.trim(),
         phone: editPhone.trim(),
+        photoURL: profileUpdates.photoURL || userInfo.photoURL,
       });
       setIsEditing(false);
-      Alert.alert('Thành công', 'Đã cập nhật thông tin');
+      setLocalImageUri(null);
+      Alert.alert("Thành công", "Đã cập nhật thông tin");
     } catch (error: any) {
-      console.error('Lỗi khi cập nhật:', error);
-      Alert.alert('Lỗi', error.message || 'Không thể cập nhật thông tin');
+      console.error("Lỗi khi cập nhật:", error);
+      Alert.alert("Lỗi", error.message || "Không thể cập nhật thông tin");
     } finally {
       setSaving(false);
     }
   };
 
   const handleLogout = async () => {
-    Alert.alert(
-      'Đăng xuất',
-      'Bạn có chắc chắn muốn đăng xuất?',
-      [
-        { text: 'Hủy', style: 'cancel' },
-        {
-          text: 'Đăng xuất',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await signOut(auth);
-              navigation.navigate('Login');
-            } catch (error) {
-              Alert.alert('Lỗi', 'Không thể đăng xuất');
-            }
-          },
+    Alert.alert("Đăng xuất", "Bạn có chắc chắn muốn đăng xuất?", [
+      { text: "Hủy", style: "cancel" },
+      {
+        text: "Đăng xuất",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            await signOut(auth);
+            navigation.navigate("Login");
+          } catch (error) {
+            Alert.alert("Lỗi", "Không thể đăng xuất");
+          }
         },
-      ]
-    );
+      },
+    ]);
   };
 
   if (loading) {
     return (
       <View style={styles.container}>
         <View style={[styles.header, { backgroundColor: themeColor }]}>
-          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backButton}>
+          <TouchableOpacity
+            onPress={() => navigation.goBack()}
+            style={styles.backButton}
+          >
             <Icon name="arrow-left" size={24} color="#fff" />
           </TouchableOpacity>
           <Text style={styles.headerTitle}>Thông tin tài khoản</Text>
@@ -190,7 +277,10 @@ const Thongtintaikhoan = () => {
     <View style={styles.container}>
       {/* Header – DÙNG MÀU THEME */}
       <View style={[styles.header, { backgroundColor: themeColor }]}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backButton}>
+        <TouchableOpacity
+          onPress={() => navigation.goBack()}
+          style={styles.backButton}
+        >
           <Icon name="arrow-left" size={24} color="#fff" />
         </TouchableOpacity>
         <Text style={styles.headerTitle}>Thông tin tài khoản</Text>
@@ -204,19 +294,30 @@ const Thongtintaikhoan = () => {
         )}
       </View>
 
-      <ScrollView style={styles.scrollContent} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        style={styles.scrollContent}
+        showsVerticalScrollIndicator={false}
+      >
         {/* Avatar & Info */}
         <View style={styles.profileSection}>
           <View style={styles.avatarContainer}>
             <Image
               source={{
-                uri: userInfo.photoURL || 'https://via.placeholder.com/120',
+                uri: userInfo.photoURL || "https://via.placeholder.com/120",
               }}
               style={styles.avatar}
             />
             {/* Nút camera – DÙNG MÀU THEME */}
-            <TouchableOpacity style={[styles.editAvatarButton, { backgroundColor: themeColor }]}>
-              <Icon name="camera" size={16} color="#fff" />
+            <TouchableOpacity
+              style={[styles.editAvatarButton, { backgroundColor: themeColor }]}
+              onPress={handlePickImage}
+              disabled={uploadingImage}
+            >
+              {uploadingImage ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Icon name="camera" size={16} color="#fff" />
+              )}
             </TouchableOpacity>
           </View>
 
@@ -231,7 +332,9 @@ const Thongtintaikhoan = () => {
               />
             </View>
           ) : (
-            <Text style={styles.userName}>{userInfo.name || 'Chưa có tên'}</Text>
+            <Text style={styles.userName}>
+              {userInfo.name || "Chưa có tên"}
+            </Text>
           )}
           <View style={styles.statusBadge}>
             {/* Bạn có thể thêm icon VIP ở đây nếu cần */}
@@ -262,7 +365,9 @@ const Thongtintaikhoan = () => {
                   keyboardType="phone-pad"
                 />
               ) : (
-                <Text style={styles.infoValue}>{userInfo.phone || 'Chưa cập nhật'}</Text>
+                <Text style={styles.infoValue}>
+                  {userInfo.phone || "Chưa cập nhật"}
+                </Text>
               )}
             </View>
           </View>
@@ -271,7 +376,9 @@ const Thongtintaikhoan = () => {
             <Icon name="calendar-check" size={20} color="#666" />
             <View style={styles.infoText}>
               <Text style={styles.infoLabel}>Ngày tham gia</Text>
-              <Text style={styles.infoValue}>{userInfo.joinDate || 'Chưa có'}</Text>
+              <Text style={styles.infoValue}>
+                {userInfo.joinDate || "Chưa có"}
+              </Text>
             </View>
           </View>
         </View>
@@ -315,7 +422,7 @@ const Thongtintaikhoan = () => {
           >
             <View style={styles.menuLeft}>
               <Icon name="logout" size={22} color="#F44336" />
-              <Text style={[styles.menuLabel, { color: '#F44336' }]}>
+              <Text style={[styles.menuLabel, { color: "#F44336" }]}>
                 Đăng xuất
               </Text>
             </View>
@@ -330,23 +437,23 @@ const Thongtintaikhoan = () => {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: "#f5f5f5",
   },
   header: {
     // ĐÃ XÓA backgroundColor: '#1E88E5'
     paddingTop: 50,
     paddingBottom: 20,
     paddingHorizontal: 16,
-    flexDirection: 'row',
-    alignItems: 'center',
+    flexDirection: "row",
+    alignItems: "center",
   },
   backButton: {
     marginRight: 16,
   },
   headerTitle: {
     fontSize: 20,
-    fontWeight: 'bold',
-    color: '#fff',
+    fontWeight: "bold",
+    color: "#fff",
     flex: 1,
   },
   editButton: {
@@ -354,25 +461,25 @@ const styles = StyleSheet.create({
   },
   loadingContainer: {
     flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
+    justifyContent: "center",
+    alignItems: "center",
   },
   loadingText: {
     marginTop: 12,
     fontSize: 14,
-    color: '#666',
+    color: "#666",
   },
   scrollContent: {
     flex: 1,
   },
   profileSection: {
-    alignItems: 'center',
+    alignItems: "center",
     paddingVertical: 24,
-    backgroundColor: '#fff',
+    backgroundColor: "#fff",
     marginBottom: 16,
   },
   avatarContainer: {
-    position: 'relative',
+    position: "relative",
     marginBottom: 12,
   },
   avatar: {
@@ -380,42 +487,42 @@ const styles = StyleSheet.create({
     height: 100,
     borderRadius: 50,
     borderWidth: 3,
-    borderColor: '#1E88E5',
+    borderColor: "#1E88E5",
   },
   editAvatarButton: {
-    position: 'absolute',
+    position: "absolute",
     bottom: 0,
     right: 0,
     width: 32,
     height: 32,
     borderRadius: 16,
-    justifyContent: 'center',
-    alignItems: 'center',
+    justifyContent: "center",
+    alignItems: "center",
     borderWidth: 2,
-    borderColor: '#fff',
+    borderColor: "#fff",
   },
   userName: {
     fontSize: 22,
-    fontWeight: '700',
-    color: '#212121',
+    fontWeight: "700",
+    color: "#212121",
     marginBottom: 6,
   },
   editForm: {
-    width: '80%',
+    width: "80%",
     marginBottom: 12,
   },
   input: {
     borderWidth: 1,
-    borderColor: '#ddd',
+    borderColor: "#ddd",
     borderRadius: 8,
     padding: 12,
     fontSize: 16,
-    backgroundColor: '#fff',
+    backgroundColor: "#fff",
   },
   statusBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#FFF8E1',
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#FFF8E1",
     paddingHorizontal: 12,
     paddingVertical: 4,
     borderRadius: 20,
@@ -423,27 +530,27 @@ const styles = StyleSheet.create({
   },
   statusText: {
     fontSize: 12,
-    fontWeight: 'bold',
-    color: '#FFB300',
+    fontWeight: "bold",
+    color: "#FFB300",
   },
   infoCard: {
-    backgroundColor: '#fff',
+    backgroundColor: "#fff",
     marginHorizontal: 16,
     marginBottom: 16,
     borderRadius: 12,
     padding: 16,
     elevation: 2,
-    shadowColor: '#000',
+    shadowColor: "#000",
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.05,
     shadowRadius: 2,
   },
   infoItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
+    flexDirection: "row",
+    alignItems: "center",
     paddingVertical: 12,
     borderBottomWidth: 1,
-    borderBottomColor: '#eee',
+    borderBottomColor: "#eee",
   },
   infoText: {
     marginLeft: 16,
@@ -451,76 +558,76 @@ const styles = StyleSheet.create({
   },
   infoLabel: {
     fontSize: 13,
-    color: '#757575',
+    color: "#757575",
     marginBottom: 2,
   },
   infoValue: {
     fontSize: 15,
-    color: '#212121',
-    fontWeight: '500',
+    color: "#212121",
+    fontWeight: "500",
   },
   actionButtons: {
-    flexDirection: 'row',
+    flexDirection: "row",
     marginHorizontal: 16,
     marginBottom: 16,
     gap: 12,
   },
   saveButton: {
     flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
     paddingVertical: 14,
     borderRadius: 12,
     gap: 8,
   },
   saveButtonText: {
-    color: '#fff',
+    color: "#fff",
     fontSize: 16,
-    fontWeight: 'bold',
+    fontWeight: "bold",
   },
   cancelButton: {
     flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
+    alignItems: "center",
+    justifyContent: "center",
     paddingVertical: 14,
     borderRadius: 12,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: "#f5f5f5",
   },
   cancelButtonText: {
-    color: '#666',
+    color: "#666",
     fontSize: 16,
-    fontWeight: '500',
+    fontWeight: "500",
   },
   menuSection: {
     marginHorizontal: 16,
-    backgroundColor: '#fff',
+    backgroundColor: "#fff",
     borderRadius: 12,
-    overflow: 'hidden',
+    overflow: "hidden",
     elevation: 2,
-    shadowColor: '#000',
+    shadowColor: "#000",
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.05,
     shadowRadius: 2,
   },
   menuItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
     paddingVertical: 14,
     paddingHorizontal: 16,
     borderBottomWidth: 1,
-    borderBottomColor: '#eee',
+    borderBottomColor: "#eee",
   },
   menuLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
+    flexDirection: "row",
+    alignItems: "center",
     gap: 12,
   },
   menuLabel: {
     fontSize: 15,
-    color: '#212121',
-    fontWeight: '500',
+    color: "#212121",
+    fontWeight: "500",
   },
 });
 

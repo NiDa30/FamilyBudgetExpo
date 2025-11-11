@@ -6,6 +6,7 @@ import {
   getDocs,
   orderBy,
   query,
+  setDoc,
   Timestamp,
   updateDoc,
   where,
@@ -25,10 +26,22 @@ class FirebaseService {
 
   async updateUser(userId, data) {
     const docRef = doc(db, COLLECTIONS.USER, userId);
-    await updateDoc(docRef, {
-      ...data,
-      updatedAt: Timestamp.now(),
-    });
+    const docSnap = await getDoc(docRef);
+    
+    if (docSnap.exists()) {
+      // Document exists, update it
+      await updateDoc(docRef, {
+        ...data,
+        updatedAt: Timestamp.now(),
+      });
+    } else {
+      // Document doesn't exist, create it
+      await setDoc(docRef, {
+        ...data,
+        createdAt: Timestamp.now(),
+        updatedAt: Timestamp.now(),
+      });
+    }
   }
 
   // ==================== CATEGORIES ====================
