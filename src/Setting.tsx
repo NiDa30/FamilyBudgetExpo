@@ -1,7 +1,7 @@
-// src/Setting.js (hoặc MenuScreen.js)
-import { useNavigation } from "@react-navigation/native";
+// src/Setting.tsx
+import { useNavigation, useFocusEffect } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Dimensions,
   Modal,
@@ -10,12 +10,16 @@ import {
   Text,
   TouchableOpacity,
   View,
+  Image,
+  ActivityIndicator,
+  Alert,
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { RootStackParamList } from "../App";
-
-// ĐÃ THÊM: DÙNG MÀU THEME
 import { useTheme } from "./context/ThemeContext";
+import { auth } from "./firebaseConfig";
+import FirebaseService from "./service/firebase/FirebaseService";
+import { signOut } from "firebase/auth";
 
 type MenuScreenNavigationProp = NativeStackNavigationProp<
   RootStackParamList,
@@ -24,13 +28,27 @@ type MenuScreenNavigationProp = NativeStackNavigationProp<
 
 const { width, height } = Dimensions.get("window");
 
+interface UserInfo {
+  name: string;
+  email: string;
+  phone?: string;
+  photoURL?: string;
+  joinDate?: string;
+}
+
 const MenuScreen = () => {
   const navigation = useNavigation<MenuScreenNavigationProp>();
-
-  // DI CHUYỂN LÊN ĐẦU – TRƯỚC useState
   const { themeColor } = useTheme();
 
   const [isDarkMode, setIsDarkMode] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [userInfo, setUserInfo] = useState<UserInfo>({
+    name: "",
+    email: "",
+    phone: "",
+    photoURL: undefined,
+    joinDate: "",
+  });
 
   const vipFeatures = [
     {
@@ -112,8 +130,108 @@ const MenuScreen = () => {
     navigation.goBack();
   };
 
-  const handleLogout = () => {
-    navigation.navigate("Login");
+  // Load user information on mount and auth state changes
+  useEffect(() => {
+    loadUserInfo();
+    
+    // Listen for auth state changes
+    const unsubscribe = auth.onAuthStateChanged((user) => {
+      if (user) {
+        loadUserInfo();
+      } else {
+        setUserInfo({ name: "", email: "", phone: "", photoURL: undefined });
+        setLoading(false);
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Reload user info when screen comes into focus (e.g., returning from profile edit)
+  useFocusEffect(
+    useCallback(() => {
+      loadUserInfo();
+    }, [])
+  );
+
+  const loadUserInfo = async () => {
+    try {
+      const user = auth.currentUser;
+      if (!user) {
+        setUserInfo({ name: "", email: "", phone: "", photoURL: undefined });
+        setLoading(false);
+        return;
+      }
+
+      // Get info from Auth
+      const authData = {
+        name: user.displayName || "",
+        email: user.email || "",
+        photoURL: user.photoURL || undefined,
+      };
+
+      // Get info from Firestore
+      let firestoreData: any = {};
+      try {
+        const userDoc: any = await FirebaseService.getUser(user.uid);
+        if (userDoc) {
+          firestoreData = {
+            phone: userDoc.phone || userDoc.phoneNumber || "",
+            joinDate: userDoc.createdAt
+              ? new Date(
+                  userDoc.createdAt.toMillis?.() || userDoc.createdAt
+                ).toLocaleDateString("vi-VN")
+              : user.metadata.creationTime
+              ? new Date(user.metadata.creationTime).toLocaleDateString("vi-VN")
+              : "",
+          };
+        }
+      } catch (error) {
+        console.log("Không tìm thấy thông tin trong Firestore");
+        firestoreData = {
+          phone: "",
+          joinDate: user.metadata.creationTime
+            ? new Date(user.metadata.creationTime).toLocaleDateString("vi-VN")
+            : "",
+        };
+      }
+
+      setUserInfo({
+        ...authData,
+        ...firestoreData,
+      });
+    } catch (error) {
+      console.error("Lỗi khi tải thông tin người dùng:", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleEditProfile = () => {
+    navigation.navigate("Thongtintaikhoan");
+  };
+
+  const handleLogout = async () => {
+    Alert.alert(
+      "Đăng xuất",
+      "Bạn có chắc chắn muốn đăng xuất?",
+      [
+        { text: "Hủy", style: "cancel" },
+        {
+          text: "Đăng xuất",
+          style: "destructive",
+          onPress: async () => {
+            try {
+              await signOut(auth);
+              navigation.navigate("Login");
+            } catch (error) {
+              console.error("Lỗi khi đăng xuất:", error);
+              Alert.alert("Lỗi", "Không thể đăng xuất");
+            }
+          },
+        },
+      ]
+    );
   };
 
   const renderMenuItem = (item: any) => (
@@ -161,26 +279,50 @@ const MenuScreen = () => {
             </TouchableOpacity>
 
             <View style={styles.profileSection}>
-              <View style={styles.avatarContainer}>
-                <View style={styles.avatar}>
-                  <Icon name="account" size={40} color="#fff" />
-                </View>
-                <View style={styles.vipBadge}>
-                  <Icon name="crown" size={12} color="#FFD700" />
-                </View>
-              </View>
-              <Text style={styles.userName}>Nguyễn Văn A</Text>
-              <Text style={styles.userEmail}>user@example.com</Text>
+              {loading ? (
+                <ActivityIndicator size="large" color="#fff" />
+              ) : (
+                <>
+                  <View style={styles.avatarContainer}>
+                    {userInfo.photoURL ? (
+                      <Image
+                        source={{ uri: userInfo.photoURL }}
+                        style={styles.avatarImage}
+                      />
+                    ) : (
+                      <View style={styles.avatar}>
+                        <Icon name="account" size={40} color="#fff" />
+                      </View>
+                    )}
+                    <View style={styles.vipBadge}>
+                      <Icon name="crown" size={12} color="#FFD700" />
+                    </View>
+                  </View>
+                  <Text style={styles.userName}>
+                    {userInfo.name || "Chưa có tên"}
+                  </Text>
+                  <Text style={styles.userEmail}>
+                    {userInfo.email || "Chưa có email"}
+                  </Text>
+                  {userInfo.phone && (
+                    <View style={styles.userPhone}>
+                      <Icon name="phone" size={12} color="rgba(255, 255, 255, 0.9)" />
+                      <Text style={styles.userPhoneText}>{userInfo.phone}</Text>
+                    </View>
+                  )}
 
-              <TouchableOpacity
-                style={styles.editProfileButton}
-                activeOpacity={0.8}
-              >
-                <Icon name="pencil" size={14} color={themeColor} />
-                <Text style={[styles.editProfileText, { color: themeColor }]}>
-                  Chỉnh sửa
-                </Text>
-              </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.editProfileButton}
+                    activeOpacity={0.8}
+                    onPress={handleEditProfile}
+                  >
+                    <Icon name="pencil" size={14} color={themeColor} />
+                    <Text style={[styles.editProfileText, { color: themeColor }]}>
+                      Chỉnh sửa
+                    </Text>
+                  </TouchableOpacity>
+                </>
+              )}
             </View>
           </View>
 
@@ -347,6 +489,23 @@ const styles = StyleSheet.create({
     alignItems: "center",
     borderWidth: 3,
     borderColor: "#fff",
+  },
+  avatarImage: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    borderWidth: 3,
+    borderColor: "#fff",
+  },
+  userPhone: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 8,
+    gap: 4,
+  },
+  userPhoneText: {
+    fontSize: 12,
+    color: "rgba(255, 255, 255, 0.85)",
   },
   vipBadge: {
     position: "absolute",
