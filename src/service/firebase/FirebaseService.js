@@ -225,17 +225,24 @@ class FirebaseService {
 
   async addBudget(userId, budget) {
     const docRef = await addDoc(collection(db, COLLECTIONS.BUDGET), {
-      budgetID: budget.id,
       userID: userId,
-      categoryID: budget.category_id,
-      monthYear: budget.month_year,
-      budgetAmount: budget.amount,
-      spentAmount: 0,
-      warningThreshold: budget.warning_threshold || 80,
+      categoryID: budget.categoryID || budget.category_id,
+      monthYear: budget.monthYear || budget.month_year,
+      budgetAmount: budget.budgetAmount || budget.amount,
+      spentAmount: budget.spentAmount || 0,
+      warningThreshold: budget.warningThreshold || budget.warning_threshold || 80,
       createdAt: Timestamp.now(),
       updatedAt: Timestamp.now(),
     });
     return docRef.id;
+  }
+
+  async updateBudget(budgetId, budget) {
+    const docRef = doc(db, COLLECTIONS.BUDGET, budgetId);
+    await updateDoc(docRef, {
+      ...budget,
+      updatedAt: Timestamp.now(),
+    });
   }
 
   // ==================== GOALS ====================

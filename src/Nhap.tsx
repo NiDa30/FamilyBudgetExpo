@@ -138,14 +138,39 @@ const NhapGiaoDich = () => {
   // ✅ HELPER FUNCTION: Sync categories from Firebase to SQLite và update UI
   const handleCategorySyncFromFirebase = useCallback(
     async (currentUserId: string, isActiveFlag: boolean) => {
+      // Retry helper function
+      const retryDbOperation = async (operation: () => Promise<any>, maxRetries = 3, delay = 100) => {
+        for (let i = 0; i < maxRetries; i++) {
+          try {
+            return await operation();
+          } catch (error: any) {
+            const errorMessage = error?.message || String(error);
+            if (
+              (errorMessage.includes("database is locked") ||
+                errorMessage.includes("finalizeAsync")) &&
+              i < maxRetries - 1
+            ) {
+              await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+              continue;
+            }
+            throw error;
+          }
+        }
+        throw new Error("Max retries exceeded");
+      };
+
       try {
         console.log("🔄 Syncing categories from Firebase to SQLite...");
 
-        // Sync Firebase → SQLite
-        await SyncEngine.pullRemoteChanges(currentUserId);
+        // Sync Firebase → SQLite with retry
+        await retryDbOperation(async () => {
+          await SyncEngine.pullRemoteChanges(currentUserId);
+        });
 
-        // Reload từ SQLite sau khi sync
-        const syncedData = await loadCategoriesFromSQLite(currentUserId);
+        // Reload từ SQLite sau khi sync with retry
+        const syncedData = await retryDbOperation(async () => {
+          return await loadCategoriesFromSQLite(currentUserId);
+        });
 
         if (isActiveFlag) {
           setExpenseCategories(syncedData.expense);
@@ -169,8 +194,11 @@ const NhapGiaoDich = () => {
 
           console.log("🔃 UI updated with synced category data from Firebase");
         }
-      } catch (error) {
-        console.warn("Failed to sync categories from Firebase:", error);
+      } catch (error: any) {
+        const errorMessage = error?.message || String(error);
+        if (!errorMessage.includes("database is locked")) {
+          console.warn("Failed to sync categories from Firebase:", error);
+        }
       }
     },
     [activeTab]
@@ -353,6 +381,27 @@ const NhapGiaoDich = () => {
       return;
     }
 
+    // Retry helper function
+    const retryDbOperation = async (operation: () => Promise<any>, maxRetries = 3, delay = 100) => {
+      for (let i = 0; i < maxRetries; i++) {
+        try {
+          return await operation();
+        } catch (error: any) {
+          const errorMessage = error?.message || String(error);
+          if (
+            (errorMessage.includes("database is locked") ||
+              errorMessage.includes("finalizeAsync")) &&
+            i < maxRetries - 1
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+            continue;
+          }
+          throw error;
+        }
+      }
+      throw new Error("Max retries exceeded");
+    };
+
     try {
       setIsSaving(true);
 
@@ -375,14 +424,23 @@ const NhapGiaoDich = () => {
         merchant_name: "",
       };
 
-      await TransactionService.createTransaction(transactionData);
+      // Retry transaction save operation
+      await retryDbOperation(async () => {
+        await TransactionService.createTransaction(transactionData);
+      });
       console.log("✅ Transaction saved to SQLite");
 
+      // Sync in background with retry
       try {
-        await SyncEngine.performSync(userId, true);
+        await retryDbOperation(async () => {
+          await SyncEngine.performSync(userId, true);
+        }, 2, 200); // 2 retries with 200ms delay for sync
         console.log("✅ Transaction synced to Firebase");
       } catch (err: any) {
-        console.error("⚠️ Sync failed, will retry later:", err);
+        const errorMessage = err?.message || String(err);
+        if (!errorMessage.includes("database is locked")) {
+          console.error("⚠️ Sync failed, will retry later:", err);
+        }
       }
 
       setAmount("0");
@@ -400,12 +458,29 @@ const NhapGiaoDich = () => {
           onPress: () => navigation.goBack(),
         },
       ]);
-    } catch (error) {
-      console.error("Error saving transaction:", error);
-      Alert.alert(
-        "Lỗi",
-        "Không thể lưu giao dịch: " + (error as Error).message
-      );
+    } catch (error: any) {
+      const errorMessage = error?.message || String(error);
+      if (!errorMessage.includes("database is locked")) {
+        console.error("Error saving transaction:", error);
+        Alert.alert(
+          "Lỗi",
+          "Không thể lưu giao dịch: " + errorMessage
+        );
+      } else {
+        // Retry once more for database lock errors
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          await TransactionService.createTransaction(transactionData);
+          console.log("✅ Transaction saved after retry");
+          Alert.alert("Thành công", "Giao dịch đã được lưu");
+        } catch (retryError) {
+          console.error("Error saving transaction after retry:", retryError);
+          Alert.alert(
+            "Lỗi",
+            "Không thể lưu giao dịch. Vui lòng thử lại sau."
+          );
+        }
+      }
     } finally {
       setIsSaving(false);
     }

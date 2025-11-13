@@ -25,11 +25,7 @@ import {
 } from "react-native";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { RootStackParamList } from "../App";
-import {
-  BudgetAlerts,
-  BudgetRecommendation,
-  GoalTracker,
-} from "./components/budget";
+import { BudgetAndGoalsOverview } from "./components/budget";
 import { BarChart, LineChart, PieChart } from "./components/charts";
 import { COLLECTIONS } from "./constants/collections";
 import { useTheme } from "./context/ThemeContext";
@@ -101,6 +97,16 @@ const ChartScreen = () => {
     colorScheme: "default" as "default" | "pastel" | "vibrant",
   });
 
+  // Budget-related states
+  const [budgetRule, setBudgetRule] = useState({
+    needsPercent: 50,
+    wantsPercent: 30,
+    savingsPercent: 20,
+  });
+  const [categoryBudgets, setCategoryBudgets] = useState<any[]>([]);
+  const [spendingTrends, setSpendingTrends] = useState<any[]>([]);
+  const [adjustmentSuggestions, setAdjustmentSuggestions] = useState<any[]>([]);
+
   // Use ref to store loadData function to avoid infinite loops
   const loadDataRef = useRef<(() => Promise<void>) | null>(null);
 
@@ -141,6 +147,56 @@ const ChartScreen = () => {
 
   // Load all data
   const loadData = useCallback(async () => {
+    // Retry helper function
+    const retryDbOperation = async <T extends any>(
+      operation: () => Promise<T>,
+      maxRetries = 3,
+      delay = 100
+    ): Promise<T> => {
+      for (let i = 0; i < maxRetries; i++) {
+        try {
+          return await operation();
+        } catch (error: any) {
+          const errorMessage = error?.message || String(error);
+          if (
+            (errorMessage.includes("database is locked") ||
+              errorMessage.includes("finalizeAsync")) &&
+            i < maxRetries - 1
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+            continue;
+          }
+          throw error;
+        }
+      }
+      throw new Error("Max retries exceeded");
+    };
+
+    // Retry helper for category operations
+    const retryCategoryOperation = async <T extends any>(
+      operation: () => Promise<T>,
+      maxRetries = 3,
+      delay = 100
+    ): Promise<T> => {
+      for (let i = 0; i < maxRetries; i++) {
+        try {
+          return await operation();
+        } catch (error: any) {
+          const errorMessage = error?.message || String(error);
+          if (
+            (errorMessage.includes("database is locked") ||
+              errorMessage.includes("finalizeAsync")) &&
+            i < maxRetries - 1
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+            continue;
+          }
+          throw error;
+        }
+      }
+      throw new Error("Max retries exceeded");
+    };
+
     try {
       setLoading(true);
       const user = auth.currentUser;
@@ -150,44 +206,74 @@ const ChartScreen = () => {
         return;
       }
 
-      await databaseService.ensureInitialized();
+      await retryDbOperation(async () => {
+        await databaseService.ensureInitialized();
+      });
 
-      // Load categories
+      // ✅ Load categories: Default from Firebase CATEGORIES_DEFAULT + User from SQLite
       try {
-        const cats = await databaseService.getCategoriesByUser(user.uid);
-        if (Array.isArray(cats)) {
-          const mappedCategories: Category[] = cats.map((row: any) => ({
-            id: row.id,
-            userId: row.user_id,
-            name: row.name,
-            type: row.type,
-            isSystemDefault: !!row.is_system_default,
-            icon: row.icon,
-            color: row.color,
-            parentCategoryId: row.parent_category_id ?? null,
-            displayOrder: row.display_order,
-            isHidden: !!row.is_hidden,
-            createdAt: row.created_at,
-          }));
-          setCategories(mappedCategories);
+        console.log("📋 Loading combined categories (default + user)...");
+        
+        // Use CategoryService to get combined categories (default from Firebase + user from SQLite)
+        const CategoryService = (await import("./services/categoryService")).default;
+        const combinedCategories = await CategoryService.getCombinedCategories(user.uid);
+        
+        console.log(`📋 Loaded ${combinedCategories.length} combined categories`);
+        
+        if (Array.isArray(combinedCategories) && combinedCategories.length > 0) {
+          setCategories(combinedCategories);
+        } else {
+          console.warn("⚠️ No categories found, trying fallback...");
+          // Fallback: Load from SQLite only
+          const cats = await retryCategoryOperation(async () => {
+            return await databaseService.getCategoriesByUser(user.uid);
+          });
+          if (Array.isArray(cats) && cats.length > 0) {
+            const mappedCategories: Category[] = cats.map((row: any) => ({
+              id: row.id,
+              userId: row.user_id,
+              name: row.name,
+              type: row.type,
+              isSystemDefault: !!row.is_system_default,
+              icon: row.icon,
+              color: row.color,
+              parentCategoryId: row.parent_category_id ?? null,
+              displayOrder: row.display_order,
+              isHidden: !!row.is_hidden,
+              createdAt: row.created_at,
+            }));
+            setCategories(mappedCategories);
+          } else {
+            // Last fallback: Try CategoryRepository
+            const cats = await retryCategoryOperation(async () => {
+              return await CategoryRepository.listByUser(user.uid);
+            });
+            setCategories(cats);
+          }
         }
-      } catch (error) {
-        console.warn("Failed to load categories:", error);
-        // Fallback to CategoryRepository
+      } catch (error: any) {
+        const errorMessage = error?.message || String(error);
+        console.warn("Failed to load combined categories:", errorMessage);
+        // Fallback to CategoryRepository with retry
         try {
-          const cats = await CategoryRepository.listByUser(user.uid);
+          const cats = await retryCategoryOperation(async () => {
+            return await CategoryRepository.listByUser(user.uid);
+          });
           setCategories(cats);
-        } catch (fallbackError) {
-          console.error(
-            "Failed to load categories from repository:",
-            fallbackError
-          );
+        } catch (fallbackError: any) {
+          const fallbackErrorMessage = fallbackError?.message || String(fallbackError);
+          if (!fallbackErrorMessage.includes("database is locked")) {
+            console.error(
+              "Failed to load categories from repository:",
+              fallbackError
+            );
+          }
         }
       }
 
       const range = getDateRange();
 
-      // ✅ Load all transactions from SQLite directly
+      // ✅ Load all transactions from SQLite directly with retry
       const options: any = {
         startDate: range.start,
         endDate: range.end,
@@ -196,16 +282,27 @@ const ChartScreen = () => {
         options.categoryId = selectedCategoryFilter;
       }
 
-      const allTransactions = await databaseService.getTransactionsByUser(
-        user.uid,
-        options
-      );
+      const allTransactions = await retryDbOperation(async () => {
+        return await databaseService.getTransactionsByUser(user.uid, options);
+      });
 
       console.log(
         `📊 Loaded ${
           allTransactions?.length || 0
         } transactions from SQLite for period ${selectedPeriod}`
       );
+      console.log(`📊 Date range: ${range.start} to ${range.end}`);
+      if (allTransactions && allTransactions.length > 0) {
+        console.log(`📊 Sample transaction:`, {
+          id: allTransactions[0].id,
+          amount: allTransactions[0].amount,
+          type: allTransactions[0].type,
+          date: allTransactions[0].date,
+          category_name: allTransactions[0].category_name,
+        });
+      } else {
+        console.warn(`⚠️ No transactions found for period ${selectedPeriod}`);
+      }
 
       // Calculate totals from SQLite data
       let income = 0;
@@ -232,14 +329,13 @@ const ChartScreen = () => {
 
       // Check for large expenses (expenses > 10% of total income or > 1M VND)
       try {
-        const allTransactions = await databaseService.getTransactionsByUser(
-          user.uid,
-          {
+        const allTransactions = await retryDbOperation(async () => {
+          return await databaseService.getTransactionsByUser(user.uid, {
             startDate: range.start,
             endDate: range.end,
             type: "EXPENSE",
-          }
-        );
+          });
+        });
         // Get current categories for mapping (transactions already include category_name)
         const largeExpenses = allTransactions
           .filter((txn: any) => {
@@ -376,13 +472,12 @@ const ChartScreen = () => {
           59
         ).toISOString();
 
-        const monthTransactions = await databaseService.getTransactionsByUser(
-          user.uid,
-          {
+        const monthTransactions = await retryDbOperation(async () => {
+          return await databaseService.getTransactionsByUser(user.uid, {
             startDate: monthStart,
             endDate: monthEnd,
-          }
-        );
+          });
+        });
 
         let monthIncome = 0;
         let monthExpense = 0;
@@ -438,13 +533,12 @@ const ChartScreen = () => {
           59
         ).toISOString();
 
-        const dayTransactions = await databaseService.getTransactionsByUser(
-          user.uid,
-          {
+        const dayTransactions = await retryDbOperation(async () => {
+          return await databaseService.getTransactionsByUser(user.uid, {
             startDate: dayStart,
             endDate: dayEnd,
-          }
-        );
+          });
+        });
 
         let dayIncome = 0;
         let dayExpense = 0;
@@ -531,14 +625,13 @@ const ChartScreen = () => {
             59
           ).toISOString();
 
-          const monthTransactions = await databaseService.getTransactionsByUser(
-            user.uid,
-            {
+          const monthTransactions = await retryDbOperation(async () => {
+            return await databaseService.getTransactionsByUser(user.uid, {
               startDate: monthStart,
               endDate: monthEnd,
               type: "EXPENSE",
-            }
-          );
+            });
+          });
 
           let monthExpense = 0;
           if (Array.isArray(monthTransactions)) {
@@ -556,6 +649,293 @@ const ChartScreen = () => {
           });
         }
         setLastMonthsExpenses(lastMonths);
+
+        // ✅ Load budget rule from user data
+        if (userData && (userData as any).budgetRule) {
+          const ruleParts = (userData as any).budgetRule.split("-");
+          if (ruleParts.length === 3) {
+            setBudgetRule({
+              needsPercent: parseInt(ruleParts[0]) || 50,
+              wantsPercent: parseInt(ruleParts[1]) || 30,
+              savingsPercent: parseInt(ruleParts[2]) || 20,
+            });
+          }
+        }
+
+        // ✅ Calculate category budgets from SQLite and Firebase
+        try {
+          const FirebaseService = (
+            await import("./service/firebase/FirebaseService")
+          ).default;
+          const budgets = await FirebaseService.getBudgets(user.uid);
+
+          const currentMonth = `${currentDateForBudget.getFullYear()}-${String(
+            currentDateForBudget.getMonth() + 1
+          ).padStart(2, "0")}`;
+
+          // Get current month's category expenses
+          const currentMonthTransactions = await retryDbOperation(async () => {
+            return await databaseService.getTransactionsByUser(user.uid, {
+              startDate: new Date(
+                currentDateForBudget.getFullYear(),
+                currentDateForBudget.getMonth(),
+                1
+              ).toISOString(),
+              endDate: new Date(
+                currentDateForBudget.getFullYear(),
+                currentDateForBudget.getMonth() + 1,
+                0,
+                23,
+                59,
+                59
+              ).toISOString(),
+              type: "EXPENSE",
+            });
+          });
+
+          // Calculate spent amounts by category
+          const categorySpentMap = new Map<string, number>();
+          if (Array.isArray(currentMonthTransactions)) {
+            currentMonthTransactions.forEach((txn: any) => {
+              const categoryId = txn.category_id || "uncategorized";
+              const amount = parseFloat(txn.amount) || 0;
+              const current = categorySpentMap.get(categoryId) || 0;
+              categorySpentMap.set(categoryId, current + amount);
+            });
+          }
+
+          // Map budgets with spent amounts
+          const mappedBudgets = budgets
+            .filter((b: any) => b.monthYear === currentMonth)
+            .map((budget: any) => {
+              const category = categories.find(
+                (c) => c.id === budget.categoryID
+              );
+              const spentAmount = categorySpentMap.get(budget.categoryID) || 0;
+              const budgetAmount = budget.budgetAmount || 0;
+              const percentage =
+                budgetAmount > 0 ? (spentAmount / budgetAmount) * 100 : 0;
+
+              return {
+                categoryId: budget.categoryID,
+                categoryName: category?.name || "Không phân loại",
+                icon: category?.icon || "tag",
+                color: category?.color || "#2196F3",
+                budgetAmount,
+                spentAmount,
+                percentage,
+              };
+            });
+
+          setCategoryBudgets(mappedBudgets);
+        } catch (error) {
+          console.warn("Failed to load category budgets:", error);
+        }
+
+        // ✅ Calculate spending trends (last 6 months)
+        try {
+          const trends: any[] = [];
+          for (let i = 5; i >= 0; i--) {
+            const date = new Date(
+              currentDateForBudget.getFullYear(),
+              currentDateForBudget.getMonth() - i,
+              1
+            );
+            const monthStart = new Date(
+              date.getFullYear(),
+              date.getMonth(),
+              1
+            ).toISOString();
+            const monthEnd = new Date(
+              date.getFullYear(),
+              date.getMonth() + 1,
+              0,
+              23,
+              59,
+              59
+            ).toISOString();
+
+            const monthTransactions = await retryDbOperation(async () => {
+              return await databaseService.getTransactionsByUser(user.uid, {
+                startDate: monthStart,
+                endDate: monthEnd,
+                type: "EXPENSE",
+              });
+            });
+
+            let monthExpense = 0;
+            if (Array.isArray(monthTransactions)) {
+              monthExpense = monthTransactions.reduce(
+                (sum, txn: any) => sum + (parseFloat(txn.amount) || 0),
+                0
+              );
+            }
+
+            // Calculate change percent compared to previous month
+            let changePercent = 0;
+            let trend: "up" | "down" | "stable" = "stable";
+            if (i > 0 && trends.length > 0) {
+              const prevExpense = trends[trends.length - 1].amount;
+              if (prevExpense > 0) {
+                changePercent =
+                  ((monthExpense - prevExpense) / prevExpense) * 100;
+                if (changePercent > 5) trend = "up";
+                else if (changePercent < -5) trend = "down";
+                else trend = "stable";
+              }
+            }
+
+            trends.push({
+              period: `${date.getFullYear()}-${String(
+                date.getMonth() + 1
+              ).padStart(2, "0")}`,
+              amount: monthExpense,
+              changePercent,
+              trend,
+            });
+          }
+          setSpendingTrends(trends);
+        } catch (error) {
+          console.warn("Failed to calculate spending trends:", error);
+        }
+
+        // ✅ Calculate adjustment suggestions
+        try {
+          const suggestions: any[] = [];
+          const currentMonth = `${currentDateForBudget.getFullYear()}-${String(
+            currentDateForBudget.getMonth() + 1
+          ).padStart(2, "0")}`;
+
+          // Get current month's expenses by category
+          const currentMonthStart = new Date(
+            currentDateForBudget.getFullYear(),
+            currentDateForBudget.getMonth(),
+            1
+          ).toISOString();
+          const currentMonthEnd = new Date(
+            currentDateForBudget.getFullYear(),
+            currentDateForBudget.getMonth() + 1,
+            0,
+            23,
+            59,
+            59
+          ).toISOString();
+
+          const currentMonthTransactions = await retryDbOperation(async () => {
+            return await databaseService.getTransactionsByUser(user.uid, {
+              startDate: currentMonthStart,
+              endDate: currentMonthEnd,
+              type: "EXPENSE",
+            });
+          });
+
+          // Calculate category expenses
+          const categoryExpenseMap = new Map<string, number>();
+          if (Array.isArray(currentMonthTransactions)) {
+            currentMonthTransactions.forEach((txn: any) => {
+              const categoryId = txn.category_id || "uncategorized";
+              const amount = parseFloat(txn.amount) || 0;
+              const current = categoryExpenseMap.get(categoryId) || 0;
+              categoryExpenseMap.set(categoryId, current + amount);
+            });
+          }
+
+          // Get budgets
+          const FirebaseService = (
+            await import("./service/firebase/FirebaseService")
+          ).default;
+          const budgets = await FirebaseService.getBudgets(user.uid);
+          const currentBudgets = budgets.filter(
+            (b: any) => b.monthYear === currentMonth
+          );
+
+          // Generate suggestions
+          currentBudgets.forEach((budget: any) => {
+            const category = categories.find((c) => c.id === budget.categoryID);
+            const spentAmount = categoryExpenseMap.get(budget.categoryID) || 0;
+            const budgetAmount = budget.budgetAmount || 0;
+
+            if (spentAmount > budgetAmount * 1.1) {
+              // Over budget by more than 10%
+              suggestions.push({
+                type: "reduce",
+                category: category?.name || "Không phân loại",
+                currentAmount: budgetAmount,
+                suggestedAmount: Math.max(
+                  spentAmount * 1.05,
+                  budgetAmount * 0.9
+                ),
+                reason: `Chi tiêu hiện tại (${formatCurrency(
+                  spentAmount
+                )}) vượt quá ngân sách (${formatCurrency(
+                  budgetAmount
+                )}). Đề xuất tăng ngân sách lên ${formatCurrency(
+                  Math.max(spentAmount * 1.05, budgetAmount * 0.9)
+                )} để phù hợp với thực tế.`,
+                impact: spentAmount > budgetAmount * 1.2 ? "high" : "medium",
+              });
+            } else if (spentAmount < budgetAmount * 0.7 && budgetAmount > 0) {
+              // Under budget by more than 30%
+              suggestions.push({
+                type: "reduce",
+                category: category?.name || "Không phân loại",
+                currentAmount: budgetAmount,
+                suggestedAmount: Math.max(
+                  spentAmount * 1.1,
+                  budgetAmount * 0.8
+                ),
+                reason: `Chi tiêu hiện tại (${formatCurrency(
+                  spentAmount
+                )}) thấp hơn nhiều so với ngân sách (${formatCurrency(
+                  budgetAmount
+                )}). Có thể giảm ngân sách để tối ưu hóa.`,
+                impact: "low",
+              });
+            }
+          });
+
+          // Check top spending categories without budgets
+          const topCategories = Array.from(categoryExpenseMap.entries())
+            .map(([categoryId, amount]) => {
+              const category = categories.find((c) => c.id === categoryId);
+              const hasBudget = currentBudgets.some(
+                (b: any) => b.categoryID === categoryId
+              );
+              return { categoryId, category, amount, hasBudget };
+            })
+            .filter((item) => !item.hasBudget && item.amount > 0)
+            .sort((a, b) => b.amount - a.amount)
+            .slice(0, 3);
+
+          const formatCurrencyLocal = (amt: number): string => {
+            if (amt >= 1000000) {
+              return `${(amt / 1000000).toFixed(1)}M ₫`;
+            }
+            return `${(amt / 1000).toFixed(0)}K ₫`;
+          };
+
+          topCategories.forEach((item) => {
+            const suggestedAmt = item.amount * 1.1;
+            suggestions.push({
+              type: "increase",
+              category: item.category?.name || "Không phân loại",
+              currentAmount: 0,
+              suggestedAmount: suggestedAmt,
+              reason: `Danh mục "${
+                item.category?.name
+              }" có chi tiêu ${formatCurrencyLocal(
+                item.amount
+              )} nhưng chưa có ngân sách. Đề xuất thiết lập ngân sách ${formatCurrencyLocal(
+                suggestedAmt
+              )}.`,
+              impact: item.amount > monthlyIncome * 0.1 ? "high" : "medium",
+            });
+          });
+
+          setAdjustmentSuggestions(suggestions);
+        } catch (error) {
+          console.warn("Failed to calculate adjustment suggestions:", error);
+        }
       } catch (error) {
         console.warn("Failed to load user data or goals:", error);
       }
@@ -578,6 +958,31 @@ const ChartScreen = () => {
         setCompareData(null);
         return;
       }
+
+      // Retry helper function
+      const retryDbOperation = async <T extends any>(
+        operation: () => Promise<T>,
+        maxRetries = 3,
+        delay = 100
+      ): Promise<T> => {
+        for (let i = 0; i < maxRetries; i++) {
+          try {
+            return await operation();
+          } catch (error: any) {
+            const errorMessage = error?.message || String(error);
+            if (
+              (errorMessage.includes("database is locked") ||
+                errorMessage.includes("finalizeAsync")) &&
+              i < maxRetries - 1
+            ) {
+              await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+              continue;
+            }
+            throw error;
+          }
+        }
+        throw new Error("Max retries exceeded");
+      };
 
       try {
         const user = auth.currentUser;
@@ -612,14 +1017,13 @@ const ChartScreen = () => {
             return;
         }
 
-        // ✅ Calculate compare totals from SQLite
-        const compareTransactions = await databaseService.getTransactionsByUser(
-          user.uid,
-          {
+        // ✅ Calculate compare totals from SQLite with retry
+        const compareTransactions = await retryDbOperation(async () => {
+          return await databaseService.getTransactionsByUser(user.uid, {
             startDate: start.toISOString(),
             endDate: end.toISOString(),
-          }
-        );
+          });
+        });
 
         let compareIncome = 0;
         let compareExpense = 0;
@@ -663,6 +1067,12 @@ const ChartScreen = () => {
       let lastReloadTime = 0;
       const RELOAD_DEBOUNCE_MS = 2000; // 2 seconds debounce
 
+      // Queue for database operations to prevent concurrent access
+      let transactionSyncQueue: Promise<void> = Promise.resolve();
+      let categorySyncQueue: Promise<void> = Promise.resolve();
+      let isSyncingTransactions = false;
+      let isSyncingCategories = false;
+
       console.log(
         "🔄 Bieudo screen focused, setting up real-time listeners..."
       );
@@ -670,6 +1080,61 @@ const ChartScreen = () => {
       let unsubscribeTransactions: (() => void) | null = null;
       let unsubscribeCategories: (() => void) | null = null;
       let unsubscribeGoals: (() => void) | null = null;
+
+      // Retry helper function
+      const retryDbOperation = async <T extends any>(
+        operation: () => Promise<T>,
+        maxRetries = 3,
+        delay = 100
+      ): Promise<T> => {
+        for (let i = 0; i < maxRetries; i++) {
+          try {
+            return await operation();
+          } catch (error: any) {
+            const errorMessage = error?.message || String(error);
+            if (
+              (errorMessage.includes("database is locked") ||
+                errorMessage.includes("finalizeAsync")) &&
+              i < maxRetries - 1
+            ) {
+              await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+              continue;
+            }
+            throw error;
+          }
+        }
+        throw new Error("Max retries exceeded");
+      };
+
+      // Retry helper for category operations
+      const retryCategoryOperation = async <T extends any>(
+        operation: () => Promise<T>,
+        maxRetries = 3,
+        delay = 100
+      ): Promise<T> => {
+        for (let i = 0; i < maxRetries; i++) {
+          try {
+            return await operation();
+          } catch (error: any) {
+            const errorMessage = error?.message || String(error);
+            if (
+              (errorMessage.includes("database is locked") ||
+                errorMessage.includes("finalizeAsync") ||
+                errorMessage.includes("UNIQUE constraint")) &&
+              i < maxRetries - 1
+            ) {
+              await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+              continue;
+            }
+            // Suppress UNIQUE constraint errors during retries
+            if (errorMessage.includes("UNIQUE constraint") && i < maxRetries - 1) {
+              continue;
+            }
+            throw error;
+          }
+        }
+        throw new Error("Max retries exceeded");
+      };
 
       // Debounced reload function - use ref to avoid dependency issues
       const debouncedReload = () => {
@@ -732,20 +1197,28 @@ const ChartScreen = () => {
                 `📊 Firebase transactions updated: ${snapshot.docs.length} transactions`
               );
 
-              // Sync Firebase transactions to SQLite
-              try {
-                const TransactionRepository = (
-                  await import("./database/repositories")
-                ).TransactionRepository;
+              // Sync Firebase transactions to SQLite with queue and retry
+              // Prevent concurrent sync operations
+              if (isSyncingTransactions) {
+                console.log("⏳ Transaction sync already in progress, skipping...");
+                return;
+              }
 
-                for (const doc of snapshot.docs) {
-                  const data = doc.data();
-                  try {
-                    const existing = await TransactionRepository.getById(
-                      doc.id
-                    );
-                    if (!existing) {
-                      await TransactionRepository.create({
+              // Queue the sync operation
+              transactionSyncQueue = transactionSyncQueue.then(async () => {
+                isSyncingTransactions = true;
+                try {
+                  const TransactionRepository = (
+                    await import("./database/repositories")
+                  ).TransactionRepository;
+
+                  // Batch process transactions to reduce database locks
+                  const transactionsToSync = [];
+                  for (const doc of snapshot.docs) {
+                    const data = doc.data();
+                    transactionsToSync.push({
+                      id: doc.id,
+                      data: {
                         id: doc.id,
                         userId: data.userID || user.uid,
                         categoryId: data.categoryID || null,
@@ -769,24 +1242,52 @@ const ChartScreen = () => {
                         createdAt: data.createdAt?.toMillis
                           ? new Date(data.createdAt.toMillis()).toISOString()
                           : new Date().toISOString(),
-                      });
-                    }
-                  } catch (syncError) {
-                    // Suppress duplicate error logs
+                      },
+                    });
                   }
-                }
 
-                // Reload data after syncing transactions (debounced)
-                // Only reload if there are actual changes
-                if (snapshot.docChanges().length > 0) {
-                  debouncedReload();
+                  // Process transactions sequentially with retry logic
+                  let syncedCount = 0;
+                  for (const { id, data: txnData } of transactionsToSync) {
+                    try {
+                      await retryDbOperation(async () => {
+                        const existing = await TransactionRepository.getById(id);
+                        if (!existing) {
+                          await TransactionRepository.create(txnData);
+                          syncedCount++;
+                        }
+                      });
+                    } catch (syncError: any) {
+                      const errorMessage = syncError?.message || String(syncError);
+                      if (!errorMessage.includes("database is locked")) {
+                        console.warn(`Failed to sync transaction ${id}:`, syncError);
+                      }
+                    }
+                    // Small delay between operations to prevent lock
+                    await new Promise((resolve) => setTimeout(resolve, 10));
+                  }
+
+                  if (syncedCount > 0) {
+                    console.log(`✅ Synced ${syncedCount} transactions to SQLite`);
+                  }
+
+                  // Reload data after syncing transactions (debounced)
+                  // Only reload if there are actual changes
+                  if (snapshot.docChanges().length > 0) {
+                    debouncedReload();
+                  }
+                } catch (syncError: any) {
+                  const errorMessage = syncError?.message || String(syncError);
+                  if (!errorMessage.includes("database is locked")) {
+                    console.warn(
+                      "Failed to sync transactions to SQLite:",
+                      syncError
+                    );
+                  }
+                } finally {
+                  isSyncingTransactions = false;
                 }
-              } catch (syncError) {
-                console.warn(
-                  "Failed to sync transactions to SQLite:",
-                  syncError
-                );
-              }
+              });
             } catch (error) {
               console.error("Error processing transaction snapshot:", error);
             }
@@ -832,121 +1333,163 @@ const ChartScreen = () => {
                 `📋 Firebase categories updated: ${snapshot.docs.length} categories`
               );
 
-              // Sync Firebase categories to SQLite
-              try {
-                const databaseServiceModule = await import(
-                  "./database/databaseService"
-                );
-                const databaseService =
-                  databaseServiceModule.default ||
-                  databaseServiceModule.DatabaseService;
+              // Sync Firebase categories to SQLite with queue and retry
+              // Prevent concurrent sync operations
+              if (isSyncingCategories) {
+                console.log("⏳ Category sync already in progress, skipping...");
+                return;
+              }
 
-                const CategoryRepository = (
-                  await import("./database/repositories")
-                ).CategoryRepository;
-                let currentSQLiteCategories =
-                  await CategoryRepository.listByUser(user.uid);
-
-                // Remove duplicates before syncing
+              // Queue the sync operation
+              categorySyncQueue = categorySyncQueue.then(async () => {
+                isSyncingCategories = true;
                 try {
-                  const removedCount =
-                    await databaseService.removeDuplicateCategories(user.uid);
-                  if (removedCount > 0) {
-                    console.log(
-                      `🧹 Removed ${removedCount} duplicate categories`
-                    );
-                    currentSQLiteCategories =
-                      await CategoryRepository.listByUser(user.uid);
-                  }
-                } catch (cleanupError) {
-                  console.warn("Failed to remove duplicates:", cleanupError);
-                }
+                  const databaseServiceModule = await import(
+                    "./database/databaseService"
+                  );
+                  const databaseService =
+                    databaseServiceModule.default ||
+                    databaseServiceModule.DatabaseService;
 
-                // Filter duplicates from Firebase
-                const seen = new Set<string>();
-                const uniqueDocs = snapshot.docs.filter((doc) => {
-                  const data = doc.data();
-                  const key = `${data.userID || user.uid}_${data.name}_${
-                    data.type || "EXPENSE"
-                  }`;
-                  if (seen.has(key)) {
-                    return false;
-                  }
-                  seen.add(key);
-                  return true;
-                });
+                  const CategoryRepository = (
+                    await import("./database/repositories")
+                  ).CategoryRepository;
+                  
+                  // Load categories with retry
+                  let currentSQLiteCategories = await retryCategoryOperation(
+                    async () => await CategoryRepository.listByUser(user.uid)
+                  );
 
-                for (const doc of uniqueDocs) {
-                  const data = doc.data();
+                  // Remove duplicates before syncing with retry
                   try {
-                    // Check by name+type, not just ID
-                    const existingByName =
-                      await databaseService.categoryExistsByName(
-                        data.userID || user.uid,
-                        data.name,
-                        data.type || "EXPENSE"
+                    const removedCount = await retryCategoryOperation(
+                      async () =>
+                        await databaseService.removeDuplicateCategories(user.uid)
+                    );
+                    if (removedCount > 0) {
+                      console.log(
+                        `🧹 Removed ${removedCount} duplicate categories`
+                      );
+                      currentSQLiteCategories = await retryCategoryOperation(
+                        async () => await CategoryRepository.listByUser(user.uid)
+                      );
+                    }
+                  } catch (cleanupError: any) {
+                    const errorMessage = cleanupError?.message || String(cleanupError);
+                    if (!errorMessage.includes("database is locked")) {
+                      console.warn("Failed to remove duplicates:", cleanupError);
+                    }
+                  }
+
+                  // Filter duplicates from Firebase
+                  const seen = new Set<string>();
+                  const uniqueDocs = snapshot.docs.filter((doc) => {
+                    const data = doc.data();
+                    const key = `${data.userID || user.uid}_${data.name}_${
+                      data.type || "EXPENSE"
+                    }`;
+                    if (seen.has(key)) {
+                      return false;
+                    }
+                    seen.add(key);
+                    return true;
+                  });
+
+                  // Process categories sequentially with retry logic
+                  for (const doc of uniqueDocs) {
+                    const data = doc.data();
+                    try {
+                      // Check by name+type, not just ID
+                      const existingByName = await retryCategoryOperation(
+                        async () =>
+                          await databaseService.categoryExistsByName(
+                            data.userID || user.uid,
+                            data.name,
+                            data.type || "EXPENSE"
+                          )
                       );
 
-                    const existsById = currentSQLiteCategories.some(
-                      (c) => c.id === doc.id
-                    );
+                      const existsById = currentSQLiteCategories.some(
+                        (c) => c.id === doc.id
+                      );
 
-                    if (!existingByName && !existsById) {
-                      try {
-                        await databaseService.createCategory({
-                          id: doc.id,
-                          user_id: data.userID || user.uid,
-                          name: data.name,
-                          type: data.type || "EXPENSE",
-                          icon: data.icon || "tag",
-                          color: data.color || "#2196F3",
-                          is_system_default: data.isSystemDefault ? 1 : 0,
-                          display_order: data.displayOrder || 0,
-                          is_hidden: data.isHidden ? 1 : 0,
-                        });
-                        await databaseService.markAsSynced(
-                          "categories",
-                          doc.id
-                        );
-                        currentSQLiteCategories.push({
-                          id: doc.id,
-                          name: data.name,
-                          type: data.type || "EXPENSE",
-                          icon: data.icon || "tag",
-                          color: data.color || "#2196F3",
-                        } as any);
-                      } catch (createError: any) {
-                        if (
-                          createError?.message?.includes("UNIQUE constraint")
-                        ) {
-                          // Category already exists, skip
+                      if (!existingByName && !existsById) {
+                        try {
+                          await retryCategoryOperation(async () => {
+                            await databaseService.createCategory({
+                              id: doc.id,
+                              user_id: data.userID || user.uid,
+                              name: data.name,
+                              type: data.type || "EXPENSE",
+                              icon: data.icon || "tag",
+                              color: data.color || "#2196F3",
+                              is_system_default: data.isSystemDefault ? 1 : 0,
+                              display_order: data.displayOrder || 0,
+                              is_hidden: data.isHidden ? 1 : 0,
+                            });
+                            await databaseService.markAsSynced(
+                              "categories",
+                              doc.id
+                            );
+                          });
+                          currentSQLiteCategories.push({
+                            id: doc.id,
+                            name: data.name,
+                            type: data.type || "EXPENSE",
+                            icon: data.icon || "tag",
+                            color: data.color || "#2196F3",
+                          } as any);
+                        } catch (createError: any) {
+                          const errorMessage = createError?.message || String(createError);
+                          if (
+                            !errorMessage.includes("UNIQUE constraint") &&
+                            !errorMessage.includes("database is locked")
+                          ) {
+                            console.warn(`Failed to create category ${doc.id}:`, createError);
+                          }
                         }
                       }
+                    } catch (syncError: any) {
+                      const errorMessage = syncError?.message || String(syncError);
+                      if (!errorMessage.includes("database is locked")) {
+                        console.warn(`Failed to sync category ${doc.id}:`, syncError);
+                      }
                     }
-                  } catch (syncError) {
-                    // Suppress duplicate error logs
+                    // Small delay between operations to prevent lock
+                    await new Promise((resolve) => setTimeout(resolve, 10));
                   }
-                }
 
-                // Remove duplicates after syncing
-                try {
-                  await databaseService.removeDuplicateCategories(user.uid);
-                } catch (cleanupError) {
-                  console.warn(
-                    "Failed to remove duplicates after sync:",
-                    cleanupError
-                  );
-                }
+                  // Remove duplicates after syncing with retry
+                  try {
+                    await retryCategoryOperation(
+                      async () =>
+                        await databaseService.removeDuplicateCategories(user.uid)
+                    );
+                  } catch (cleanupError: any) {
+                    const errorMessage = cleanupError?.message || String(cleanupError);
+                    if (!errorMessage.includes("database is locked")) {
+                      console.warn(
+                        "Failed to remove duplicates after sync:",
+                        cleanupError
+                      );
+                    }
+                  }
 
-                // Reload data after syncing categories (debounced)
-                // Only reload if there are actual changes
-                const changes = snapshot.docChanges();
-                if (changes.length > 0) {
-                  debouncedReload();
+                  // Reload data after syncing categories (debounced)
+                  // Only reload if there are actual changes
+                  const changes = snapshot.docChanges();
+                  if (changes.length > 0) {
+                    debouncedReload();
+                  }
+                } catch (syncError: any) {
+                  const errorMessage = syncError?.message || String(syncError);
+                  if (!errorMessage.includes("database is locked")) {
+                    console.warn("Failed to sync categories to SQLite:", syncError);
+                  }
+                } finally {
+                  isSyncingCategories = false;
                 }
-              } catch (syncError) {
-                console.warn("Failed to sync categories to SQLite:", syncError);
-              }
+              });
             } catch (error) {
               console.error("Error processing category snapshot:", error);
             }
@@ -1034,12 +1577,13 @@ const ChartScreen = () => {
     }, []) // Empty dependency array - only set up listeners once
   );
 
-  const formatCurrency = (amount: number): string => {
+  // Format currency helper function
+  const formatCurrency = useCallback((amount: number): string => {
     if (amount >= 1000000) {
       return `${(amount / 1000000).toFixed(1)}M ₫`;
     }
     return `${(amount / 1000).toFixed(0)}K ₫`;
-  };
+  }, []);
 
   const PeriodButton = ({
     period,
@@ -1607,29 +2151,24 @@ const ChartScreen = () => {
         )}
 
         {activeTab === "budget" && (
-          <>
-            {/* Budget Recommendation */}
-            <BudgetRecommendation
-              monthlyIncome={monthlyIncome}
-              lastMonthsExpenses={lastMonthsExpenses}
-              themeColor={themeColor}
-            />
-
-            {/* Budget Alerts */}
-            {budgetAlerts.length > 0 && (
-              <BudgetAlerts alerts={budgetAlerts} themeColor={themeColor} />
-            )}
-
-            {/* Goal Tracker */}
-            <GoalTracker
-              goals={goals}
-              themeColor={themeColor}
-              onAddGoalPress={() => {
-                // TODO: Navigate to goal creation screen
-                console.log("Navigate to goal creation");
-              }}
-            />
-          </>
+          <BudgetAndGoalsOverview
+            monthlyIncome={monthlyIncome}
+            lastMonthsExpenses={lastMonthsExpenses}
+            categories={categories}
+            budgetAlerts={budgetAlerts}
+            goals={goals}
+            categoryBudgets={categoryBudgets}
+            spendingTrends={spendingTrends}
+            adjustmentSuggestions={adjustmentSuggestions}
+            budgetRule={budgetRule}
+            themeColor={themeColor}
+            onReloadData={() => {
+              if (loadDataRef.current) {
+                loadDataRef.current();
+              }
+            }}
+            formatCurrency={formatCurrency}
+          />
         )}
 
         <View style={{ height: 40 }} />
@@ -2466,6 +3005,116 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
     color: "#424242",
+  },
+  budgetRuleContainer: {
+    padding: 16,
+  },
+  budgetRuleDescription: {
+    fontSize: 14,
+    color: "#757575",
+    marginBottom: 20,
+    lineHeight: 20,
+  },
+  budgetRuleItem: {
+    marginBottom: 20,
+    padding: 16,
+    backgroundColor: "#FAFAFA",
+    borderRadius: 12,
+  },
+  budgetRuleItemHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 12,
+    gap: 8,
+  },
+  budgetRuleItemLabel: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#212121",
+  },
+  budgetRuleInputContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    marginBottom: 8,
+  },
+  budgetRuleInput: {
+    flex: 1,
+    fontSize: 16,
+    color: "#212121",
+    paddingVertical: 12,
+  },
+  budgetRulePercent: {
+    fontSize: 16,
+    color: "#757575",
+    marginLeft: 8,
+  },
+  budgetRuleAmount: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#424242",
+  },
+  budgetRuleTotal: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: 16,
+    backgroundColor: "#F5F5F5",
+    borderRadius: 12,
+    marginBottom: 20,
+  },
+  budgetRuleTotalLabel: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#212121",
+  },
+  budgetRuleTotalValue: {
+    fontSize: 20,
+    fontWeight: "700",
+  },
+  budgetRuleSaveButton: {
+    paddingVertical: 14,
+    borderRadius: 8,
+    alignItems: "center",
+  },
+  budgetRuleSaveButtonText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#fff",
+  },
+  categoryBudgetList: {
+    padding: 16,
+  },
+  categoryBudgetListTitle: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#212121",
+    marginBottom: 16,
+  },
+  categoryBudgetListItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 16,
+    backgroundColor: "#FAFAFA",
+    borderRadius: 12,
+    marginBottom: 12,
+  },
+  categoryBudgetListIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    justifyContent: "center",
+    alignItems: "center",
+    marginRight: 12,
+  },
+  categoryBudgetListText: {
+    flex: 1,
+    fontSize: 16,
+    fontWeight: "500",
+    color: "#212121",
   },
 });
 

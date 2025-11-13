@@ -82,6 +82,38 @@ const HomeScreen = () => {
         where("isDeleted", "==", false)
       );
 
+      // Database operation queue to prevent concurrent access
+      let transactionSyncQueue: Promise<void> = Promise.resolve();
+      let isSyncingTransactions = false;
+
+      // Retry helper function
+      const retryDbOperation = async <T extends any>(
+        operation: () => Promise<T>,
+        maxRetries = 3,
+        delay = 100
+      ): Promise<T> => {
+        for (let i = 0; i < maxRetries; i++) {
+          try {
+            return await operation();
+          } catch (error: any) {
+            const errorMessage = error?.message || String(error);
+            if (
+              errorMessage.includes("database is locked") ||
+              errorMessage.includes("finalizeAsync")
+            ) {
+              if (i < maxRetries - 1) {
+                await new Promise((resolve) =>
+                  setTimeout(resolve, delay * (i + 1))
+                );
+                continue;
+              }
+            }
+            throw error;
+          }
+        }
+        throw new Error("Max retries exceeded");
+      };
+
       const unsubscribeTransactions = onSnapshot(
         transactionsQuery,
         async (snapshot) => {
@@ -89,21 +121,27 @@ const HomeScreen = () => {
             `📊 Firebase transactions updated: ${snapshot.docs.length} transactions`
           );
 
-          // Sync Firebase transactions to SQLite
-          try {
-            const TransactionRepository = (
-              await import("./database/repositories")
-            ).TransactionRepository;
+          // Prevent concurrent sync operations
+          if (isSyncingTransactions) {
+            console.log("⏳ Transaction sync already in progress, skipping...");
+            return;
+          }
 
-            for (const doc of snapshot.docs) {
-              const data = doc.data();
-              try {
-                // Check if transaction exists in SQLite
-                const existing = await TransactionRepository.getById(doc.id);
+          // Queue the sync operation
+          transactionSyncQueue = transactionSyncQueue.then(async () => {
+            isSyncingTransactions = true;
+            try {
+              const TransactionRepository = (
+                await import("./database/repositories")
+              ).TransactionRepository;
 
-                if (!existing) {
-                  // Save new transaction to SQLite
-                  await TransactionRepository.create({
+              // Batch process transactions to reduce database locks
+              const transactionsToSync = [];
+              for (const doc of snapshot.docs) {
+                const data = doc.data();
+                transactionsToSync.push({
+                  id: doc.id,
+                  data: {
                     id: doc.id,
                     userId: data.userID || user.uid,
                     categoryId: data.categoryID || null,
@@ -127,22 +165,52 @@ const HomeScreen = () => {
                     createdAt: data.createdAt?.toMillis
                       ? new Date(data.createdAt.toMillis()).toISOString()
                       : new Date().toISOString(),
+                  },
+                });
+              }
+
+              // Process transactions sequentially with retry logic
+              let syncedCount = 0;
+              for (const { id, data: txnData } of transactionsToSync) {
+                try {
+                  await retryDbOperation(async () => {
+                    const existing = await TransactionRepository.getById(id);
+                    if (!existing) {
+                      await TransactionRepository.create(txnData);
+                      syncedCount++;
+                    }
                   });
-                  console.log(`✅ Synced transaction ${doc.id} to SQLite`);
+                } catch (syncError: any) {
+                  const errorMessage = syncError?.message || String(syncError);
+                  if (!errorMessage.includes("database is locked")) {
+                    console.warn(
+                      `Failed to sync transaction ${id}:`,
+                      syncError
+                    );
+                  }
                 }
-              } catch (syncError) {
+                // Small delay between operations to prevent lock
+                await new Promise((resolve) => setTimeout(resolve, 10));
+              }
+
+              if (syncedCount > 0) {
+                console.log(`✅ Synced ${syncedCount} transactions to SQLite`);
+              }
+
+              // Refresh totals when transactions change
+              await retryDbOperation(() => refreshTotals());
+            } catch (syncError: any) {
+              const errorMessage = syncError?.message || String(syncError);
+              if (!errorMessage.includes("database is locked")) {
                 console.warn(
-                  `Failed to sync transaction ${doc.id}:`,
+                  "Failed to sync transactions to SQLite:",
                   syncError
                 );
               }
+            } finally {
+              isSyncingTransactions = false;
             }
-          } catch (syncError) {
-            console.warn("Failed to sync transactions to SQLite:", syncError);
-          }
-
-          // Refresh totals when transactions change
-          await refreshTotals();
+          });
         },
         (error) => {
           console.error("Firebase transactions listener error:", error);
@@ -160,6 +228,36 @@ const HomeScreen = () => {
       let categorySyncTimeout: ReturnType<typeof setTimeout> | null = null;
       let lastCategorySyncTime = 0;
       const CATEGORY_SYNC_DEBOUNCE_MS = 2000; // 2 seconds debounce
+      let categorySyncQueue: Promise<void> = Promise.resolve();
+      let isSyncingCategories = false;
+
+      // Retry helper function for categories
+      const retryCategoryOperation = async <T extends any>(
+        operation: () => Promise<T>,
+        maxRetries = 3,
+        delay = 100
+      ): Promise<T> => {
+        for (let i = 0; i < maxRetries; i++) {
+          try {
+            return await operation();
+          } catch (error: any) {
+            const errorMessage = error?.message || String(error);
+            if (
+              errorMessage.includes("database is locked") ||
+              errorMessage.includes("finalizeAsync")
+            ) {
+              if (i < maxRetries - 1) {
+                await new Promise((resolve) =>
+                  setTimeout(resolve, delay * (i + 1))
+                );
+                continue;
+              }
+            }
+            throw error;
+          }
+        }
+        throw new Error("Max retries exceeded");
+      };
 
       const unsubscribeCategories = onSnapshot(
         categoriesQuery,
@@ -170,6 +268,12 @@ const HomeScreen = () => {
             return; // No changes, skip sync
           }
 
+          // Prevent concurrent sync operations
+          if (isSyncingCategories) {
+            console.log("⏳ Category sync already in progress, skipping...");
+            return;
+          }
+
           const now = Date.now();
           // Debounce: skip if synced too recently
           if (now - lastCategorySyncTime < CATEGORY_SYNC_DEBOUNCE_MS) {
@@ -178,14 +282,32 @@ const HomeScreen = () => {
               clearTimeout(categorySyncTimeout);
             }
             categorySyncTimeout = setTimeout(async () => {
-              await handleCategorySync(snapshot, user.uid);
-              lastCategorySyncTime = Date.now();
+              categorySyncQueue = categorySyncQueue.then(async () => {
+                isSyncingCategories = true;
+                try {
+                  await retryCategoryOperation(() =>
+                    handleCategorySync(snapshot, user.uid)
+                  );
+                  lastCategorySyncTime = Date.now();
+                } finally {
+                  isSyncingCategories = false;
+                }
+              });
             }, CATEGORY_SYNC_DEBOUNCE_MS);
             return;
           }
 
           lastCategorySyncTime = now;
-          await handleCategorySync(snapshot, user.uid);
+          categorySyncQueue = categorySyncQueue.then(async () => {
+            isSyncingCategories = true;
+            try {
+              await retryCategoryOperation(() =>
+                handleCategorySync(snapshot, user.uid)
+              );
+            } finally {
+              isSyncingCategories = false;
+            }
+          });
         },
         (error) => {
           console.error("Firebase categories listener error:", error);
@@ -205,24 +327,30 @@ const HomeScreen = () => {
 
           const CategoryRepository = (await import("./database/repositories"))
             .CategoryRepository;
-          let currentSQLiteCategories = await CategoryRepository.listByUser(
-            uid
+
+          // Retry database operations
+          let currentSQLiteCategories = await retryCategoryOperation(() =>
+            CategoryRepository.listByUser(uid)
           );
 
           // Remove duplicates before syncing
           try {
-            const removedCount =
-              await databaseService.removeDuplicateCategories(uid);
+            const removedCount = await retryCategoryOperation(() =>
+              databaseService.removeDuplicateCategories(uid)
+            );
             if (removedCount > 0) {
               console.log(
                 `🧹 Removed ${removedCount} duplicate categories before sync`
               );
-              currentSQLiteCategories = await CategoryRepository.listByUser(
-                uid
+              currentSQLiteCategories = await retryCategoryOperation(() =>
+                CategoryRepository.listByUser(uid)
               );
             }
-          } catch (cleanupError) {
-            console.warn("Failed to remove duplicates:", cleanupError);
+          } catch (cleanupError: any) {
+            const errorMessage = cleanupError?.message || String(cleanupError);
+            if (!errorMessage.includes("database is locked")) {
+              console.warn("Failed to remove duplicates:", cleanupError);
+            }
           }
 
           // Filter duplicates from Firebase data
@@ -255,11 +383,13 @@ const HomeScreen = () => {
           for (const doc of uniqueDocs) {
             const data = doc.data();
             try {
-              // Check if category exists by name+type (not just ID)
-              const existingByName = await databaseService.categoryExistsByName(
-                data.userID || uid,
-                data.name,
-                data.type || "EXPENSE"
+              // Check if category exists by name+type (not just ID) with retry
+              const existingByName = await retryCategoryOperation(() =>
+                databaseService.categoryExistsByName(
+                  data.userID || uid,
+                  data.name,
+                  data.type || "EXPENSE"
+                )
               );
 
               const existsById = currentSQLiteCategories.some(
@@ -269,18 +399,20 @@ const HomeScreen = () => {
               if (!existingByName && !existsById) {
                 // Save new category to SQLite using INSERT OR REPLACE to avoid UNIQUE constraint errors
                 try {
-                  await databaseService.createCategory({
-                    id: doc.id,
-                    user_id: data.userID || uid,
-                    name: data.name,
-                    type: data.type || "EXPENSE",
-                    icon: data.icon || "tag",
-                    color: data.color || "#2196F3",
-                    is_system_default: data.isSystemDefault ? 1 : 0,
-                    display_order: data.displayOrder || 0,
-                    is_hidden: data.isHidden ? 1 : 0,
+                  await retryCategoryOperation(async () => {
+                    await databaseService.createCategory({
+                      id: doc.id,
+                      user_id: data.userID || uid,
+                      name: data.name,
+                      type: data.type || "EXPENSE",
+                      icon: data.icon || "tag",
+                      color: data.color || "#2196F3",
+                      is_system_default: data.isSystemDefault ? 1 : 0,
+                      display_order: data.displayOrder || 0,
+                      is_hidden: data.isHidden ? 1 : 0,
+                    });
+                    await databaseService.markAsSynced("categories", doc.id);
                   });
-                  await databaseService.markAsSynced("categories", doc.id);
 
                   // ✅ UPDATE STATE: Add to currentSQLiteCategories to prevent duplicate syncs
                   currentSQLiteCategories.push({
@@ -294,18 +426,25 @@ const HomeScreen = () => {
                   syncedCount++;
                 } catch (createError: any) {
                   // If UNIQUE constraint error, try to update instead
-                  if (createError?.message?.includes("UNIQUE constraint")) {
+                  const errorMessage =
+                    createError?.message || String(createError);
+                  if (errorMessage.includes("UNIQUE constraint")) {
                     try {
-                      await databaseService.updateCategory(doc.id, {
-                        name: data.name,
-                        type: data.type || "EXPENSE",
-                        icon: data.icon || "tag",
-                        color: data.color || "#2196F3",
-                        is_system_default: data.isSystemDefault ? 1 : 0,
-                        display_order: data.displayOrder || 0,
-                        is_hidden: data.isHidden ? 1 : 0,
+                      await retryCategoryOperation(async () => {
+                        await databaseService.updateCategory(doc.id, {
+                          name: data.name,
+                          type: data.type || "EXPENSE",
+                          icon: data.icon || "tag",
+                          color: data.color || "#2196F3",
+                          is_system_default: data.isSystemDefault ? 1 : 0,
+                          display_order: data.displayOrder || 0,
+                          is_hidden: data.isHidden ? 1 : 0,
+                        });
+                        await databaseService.markAsSynced(
+                          "categories",
+                          doc.id
+                        );
                       });
-                      await databaseService.markAsSynced("categories", doc.id);
 
                       // ✅ UPDATE STATE: Add to currentSQLiteCategories to prevent duplicate syncs
                       const alreadyExists = currentSQLiteCategories.some(
@@ -322,40 +461,65 @@ const HomeScreen = () => {
                       }
 
                       updatedCount++;
-                    } catch (updateError) {
-                      // Suppress duplicate error logs
+                    } catch (updateError: any) {
+                      // Suppress duplicate error logs and database lock errors
+                      const updateErrorMessage =
+                        updateError?.message || String(updateError);
+                      if (
+                        !updateErrorMessage.includes("UNIQUE constraint") &&
+                        !updateErrorMessage.includes("database is locked")
+                      ) {
+                        console.warn(
+                          `Failed to update category ${doc.id}:`,
+                          updateError
+                        );
+                      }
                     }
+                  } else if (!errorMessage.includes("database is locked")) {
+                    console.warn(
+                      `Failed to create category ${doc.id}:`,
+                      createError
+                    );
                   }
                 }
               } else {
                 skippedCount++;
               }
-            } catch (syncError) {
-              // Suppress duplicate error logs for UNIQUE constraint errors
+            } catch (syncError: any) {
+              // Suppress duplicate error logs for UNIQUE constraint and database lock errors
               const errorMessage =
                 syncError instanceof Error
                   ? syncError.message
                   : String(syncError);
-              if (!errorMessage.includes("UNIQUE constraint")) {
+              if (
+                !errorMessage.includes("UNIQUE constraint") &&
+                !errorMessage.includes("database is locked")
+              ) {
                 console.warn(`Failed to sync category ${doc.id}:`, syncError);
               }
             }
+            // Small delay between operations to prevent lock
+            await new Promise((resolve) => setTimeout(resolve, 10));
           }
 
           // Remove duplicates after syncing
           try {
-            const removedCount =
-              await databaseService.removeDuplicateCategories(uid);
+            const removedCount = await retryCategoryOperation(() =>
+              databaseService.removeDuplicateCategories(uid)
+            );
             if (removedCount > 0) {
               console.log(
                 `🧹 Removed ${removedCount} duplicate categories after sync`
               );
             }
-          } catch (cleanupError) {
-            console.warn(
-              "Failed to remove duplicates after sync:",
-              cleanupError
-            );
+          } catch (cleanupError: any) {
+            const errorMessage = cleanupError?.message || String(cleanupError);
+            if (!errorMessage.includes("database is locked")) {
+              console.warn(
+                "Failed to remove duplicates after sync:",
+                cleanupError
+              );
+            }
           }
 
           // Log batch sync results only if there were changes
@@ -364,12 +528,22 @@ const HomeScreen = () => {
               `📋 Categories synced: ${syncedCount} new, ${updatedCount} updated, ${skippedCount} skipped`
             );
           }
-        } catch (syncError) {
-          console.warn("Failed to sync categories to SQLite:", syncError);
+        } catch (syncError: any) {
+          const errorMessage = syncError?.message || String(syncError);
+          if (!errorMessage.includes("database is locked")) {
+            console.warn("Failed to sync categories to SQLite:", syncError);
+          }
         }
 
-        // Reload categories when they change
-        await loadCategories();
+        // Reload categories when they change with retry
+        try {
+          await retryCategoryOperation(() => loadCategories());
+        } catch (error: any) {
+          const errorMessage = error?.message || String(error);
+          if (!errorMessage.includes("database is locked")) {
+            console.warn("Failed to reload categories:", error);
+          }
+        }
       };
 
       return () => {
@@ -692,20 +866,32 @@ const HomeScreen = () => {
       <View style={[styles.categoryIcon, { backgroundColor: item.color }]}>
         <Icon name={item.icon} size={26} color="#fff" />
       </View>
-      <Text style={styles.categoryName}>{item.name}</Text>
-      <Icon
-        name="chevron-right"
-        size={20}
-        color="#BDBDBD"
-        style={styles.categoryArrow}
-      />
+      <View style={styles.categoryInfo}>
+        <Text style={styles.categoryName}>{item.name}</Text>
+        <Text style={styles.categoryType}>
+          {activeTab === "expense" ? "Chi tiêu" : "Thu nhập"}
+        </Text>
+      </View>
+      <View style={styles.categoryAction}>
+        <Icon
+          name="chevron-right"
+          size={24}
+          color="#BDBDBD"
+          style={styles.categoryArrow}
+        />
+      </View>
     </TouchableOpacity>
   );
 
   return (
     <View style={styles.container}>
-      {/* Header – DÙNG MÀU THEME */}
+      {/* Header – DÙNG MÀU THEME vớiグラデーション */}
       <View style={[styles.blueHeader, { backgroundColor: themeColor }]}>
+        {/* Decorative circles */}
+        <View style={styles.headerDecor1} />
+        <View style={styles.headerDecor2} />
+        <View style={styles.headerDecor3} />
+
         {/* Status bar */}
         <View style={styles.statusBar}>
           <Text style={styles.statusTime}>{formatTime()}</Text>
@@ -751,78 +937,129 @@ const HomeScreen = () => {
           </TouchableOpacity>
         </View>
 
-        {/* Budget display */}
+        {/* Budget display - Improved */}
         <View style={styles.budgetContainer}>
           <Text style={styles.budgetLabel}>Tổng số dư</Text>
           <View style={styles.budgetAmountWrapper}>
             <Text style={styles.currencySymbol}>₫</Text>
-            <Text style={styles.budgetAmount}>
-              {formatCurrency(totalBalance)}
+            <Text
+              style={[
+                styles.budgetAmount,
+                { color: totalBalance >= 0 ? "#fff" : "#FFEBEE" },
+              ]}
+            >
+              {formatCurrency(Math.abs(totalBalance))}
             </Text>
           </View>
+          {totalBalance < 0 && (
+            <View style={styles.warningBadge}>
+              <Icon name="alert-circle" size={14} color="#FF5252" />
+              <Text style={styles.warningText}>Chi tiêu vượt quá thu nhập</Text>
+            </View>
+          )}
         </View>
 
-        {/* Expense and Income Cards */}
+        {/* Expense and Income Cards - Enhanced */}
         <View style={styles.summaryContainer}>
-          <View style={styles.summaryCard}>
-            <View style={styles.summaryIconWrapper}>
-              <Icon name="arrow-up" size={20} color="#FF5252" />
+          <View style={[styles.summaryCard, styles.summaryCardEnhanced]}>
+            <View
+              style={[styles.summaryIconWrapper, styles.summaryIconEnhanced]}
+            >
+              <Icon name="arrow-up" size={22} color="#FF5252" />
             </View>
             <View style={styles.summaryInfo}>
               <Text style={styles.summaryLabel}>Chi tiêu</Text>
-              <Text style={styles.summaryAmount}>
+              <Text style={[styles.summaryAmount, { color: "#FF5252" }]}>
                 {formatCurrency(totalExpense)} ₫
               </Text>
             </View>
+            <View style={styles.summaryTrend}>
+              <Icon name="trending-up" size={16} color="#FF5252" />
+            </View>
           </View>
-          <View style={[styles.summaryCard, { marginLeft: 12 }]}>
+          <View
+            style={[
+              styles.summaryCard,
+              styles.summaryCardEnhanced,
+              { marginLeft: 12 },
+            ]}
+          >
             <View
               style={[
                 styles.summaryIconWrapper,
+                styles.summaryIconEnhanced,
                 { backgroundColor: "rgba(76, 175, 80, 0.15)" },
               ]}
             >
-              <Icon name="arrow-down" size={20} color="#4CAF50" />
+              <Icon name="arrow-down" size={22} color="#4CAF50" />
             </View>
             <View style={styles.summaryInfo}>
               <Text style={styles.summaryLabel}>Thu nhập</Text>
-              <Text style={styles.summaryAmount}>
+              <Text style={[styles.summaryAmount, { color: "#4CAF50" }]}>
                 {formatCurrency(totalIncome)} ₫
               </Text>
+            </View>
+            <View
+              style={[
+                styles.summaryTrend,
+                { backgroundColor: "rgba(76, 175, 80, 0.1)" },
+              ]}
+            >
+              <Icon name="trending-down" size={16} color="#4CAF50" />
             </View>
           </View>
         </View>
       </View>
 
-      {/* White section with shadow */}
+      {/* White section with shadow - Enhanced */}
       <View style={styles.whiteSection}>
         <View style={styles.budgetSettingHeader}>
-          <Text style={styles.budgetSettingTitle}>Ngân sách tháng này</Text>
-          <TouchableOpacity activeOpacity={0.7}>
+          <View style={styles.budgetTitleWrapper}>
+            <Icon name="wallet-outline" size={20} color={themeColor} />
+            <Text style={styles.budgetSettingTitle}>Ngân sách tháng này</Text>
+          </View>
+          <TouchableOpacity style={styles.settingsButton} activeOpacity={0.7}>
+            <Icon name="cog-outline" size={18} color={themeColor} />
             <Text style={styles.budgetSettingLink}>Cài đặt</Text>
           </TouchableOpacity>
         </View>
-        <View style={styles.budgetBar}>
-          <View
-            style={[
-              styles.budgetBarFill,
-              {
-                width:
-                  totalExpense > 0
-                    ? `${Math.min(
-                        (totalExpense / (totalIncome || 1)) * 100,
-                        100
-                      )}%`
-                    : "0%",
-              },
-            ]}
-          />
+        <View style={styles.budgetBarContainer}>
+          <View style={styles.budgetBar}>
+            <View
+              style={[
+                styles.budgetBarFill,
+                {
+                  width:
+                    totalExpense > 0 && totalIncome > 0
+                      ? `${Math.min((totalExpense / totalIncome) * 100, 100)}%`
+                      : "0%",
+                  backgroundColor:
+                    totalExpense > 0 &&
+                    totalIncome > 0 &&
+                    totalExpense / totalIncome > 0.8
+                      ? "#FF5252"
+                      : totalExpense > 0 &&
+                        totalIncome > 0 &&
+                        totalExpense / totalIncome > 0.5
+                      ? "#FF9800"
+                      : "#4CAF50",
+                },
+              ]}
+            />
+          </View>
+          <View style={styles.budgetInfoRow}>
+            <Text style={styles.budgetBarText}>
+              {totalExpense > 0 && totalIncome > 0
+                ? `Đã chi ${Math.round((totalExpense / totalIncome) * 100)}%`
+                : "Chưa có dữ liệu"}
+            </Text>
+            {totalIncome > 0 && (
+              <Text style={styles.budgetRemainingText}>
+                Còn lại: {formatCurrency(totalIncome - totalExpense)} ₫
+              </Text>
+            )}
+          </View>
         </View>
-        <Text style={styles.budgetBarText}>
-          {totalExpense > 0
-            ? `Đã chi ${Math.round((totalExpense / (totalIncome || 1)) * 100)}%`
-            : "Chưa có dữ liệu"}
-        </Text>
       </View>
 
       {/* Empty state with better design */}
@@ -903,14 +1140,16 @@ const HomeScreen = () => {
         />
       )}
 
-      {/* Bottom navigation */}
+      {/* Bottom navigation - Enhanced */}
       <View style={styles.bottomNav}>
         <TouchableOpacity
           style={styles.navItem}
           onPress={() => navigation.navigate("Timkiem")}
           activeOpacity={0.7}
         >
-          <Icon name="text-box-search-outline" size={26} color="#9E9E9E" />
+          <View style={styles.navIconWrapper}>
+            <Icon name="text-box-search-outline" size={24} color="#9E9E9E" />
+          </View>
           <Text style={styles.navLabel}>Tìm Kiếm</Text>
         </TouchableOpacity>
 
@@ -919,9 +1158,11 @@ const HomeScreen = () => {
           onPress={() => navigation.navigate("Home")}
           activeOpacity={0.7}
         >
-          <Icon name="view-grid-outline" size={26} color="#2196F3" />
+          <View style={[styles.navIconWrapper, styles.navIconActive]}>
+            <Icon name="view-grid-outline" size={24} color={themeColor} />
+          </View>
           <Text
-            style={[styles.navLabel, { color: "#2196F3", fontWeight: "600" }]}
+            style={[styles.navLabel, { color: themeColor, fontWeight: "600" }]}
           >
             Tổng Quan
           </Text>
@@ -932,7 +1173,9 @@ const HomeScreen = () => {
           onPress={() => navigation.navigate("Bieudo")}
           activeOpacity={0.7}
         >
-          <Icon name="chart-pie" size={26} color="#9E9E9E" />
+          <View style={styles.navIconWrapper}>
+            <Icon name="chart-pie" size={24} color="#9E9E9E" />
+          </View>
           <Text style={styles.navLabel}>Thống Kê</Text>
         </TouchableOpacity>
 
@@ -941,11 +1184,13 @@ const HomeScreen = () => {
           activeOpacity={0.7}
           onPress={() => navigation.navigate("Quethoadon")}
         >
-          <Icon name="qrcode-scan" size={26} color="#9E9E9E" />
+          <View style={styles.navIconWrapper}>
+            <Icon name="qrcode-scan" size={24} color="#9E9E9E" />
+          </View>
           <Text style={styles.navLabel}>Quét hóa đơn</Text>
         </TouchableOpacity>
 
-        {/* FAB button – DÙNG MÀU THEME */}
+        {/* FAB button – Enhanced with ripple effect */}
         <TouchableOpacity
           style={[
             styles.addButton,
@@ -954,7 +1199,9 @@ const HomeScreen = () => {
           onPress={() => setShowCategoryModal(true)}
           activeOpacity={0.9}
         >
-          <Icon name="plus" size={28} color="#fff" />
+          <View style={styles.addButtonInner}>
+            <Icon name="plus" size={28} color="#fff" />
+          </View>
         </TouchableOpacity>
       </View>
 
@@ -1076,12 +1323,41 @@ const styles = StyleSheet.create({
   blueHeader: {
     // ĐÃ XÓA backgroundColor: '#1E88E5'
     paddingTop: 10,
-    paddingBottom: 20,
+    paddingBottom: 24,
     shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 5,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 12,
+    elevation: 8,
+    position: "relative",
+    overflow: "hidden",
+  },
+  headerDecor1: {
+    position: "absolute",
+    width: 200,
+    height: 200,
+    borderRadius: 100,
+    backgroundColor: "rgba(255, 255, 255, 0.1)",
+    top: -80,
+    right: -80,
+  },
+  headerDecor2: {
+    position: "absolute",
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    backgroundColor: "rgba(255, 255, 255, 0.08)",
+    top: 40,
+    left: -50,
+  },
+  headerDecor3: {
+    position: "absolute",
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    backgroundColor: "rgba(255, 255, 255, 0.06)",
+    bottom: -30,
+    right: 50,
   },
   statusBar: {
     flexDirection: "row",
@@ -1153,12 +1429,15 @@ const styles = StyleSheet.create({
   budgetContainer: {
     paddingHorizontal: 20,
     marginTop: 24,
+    position: "relative",
+    zIndex: 1,
   },
   budgetLabel: {
-    color: "rgba(255, 255, 255, 0.9)",
+    color: "rgba(255, 255, 255, 0.95)",
     fontSize: 14,
-    marginBottom: 4,
+    marginBottom: 6,
     fontWeight: "500",
+    letterSpacing: 0.5,
   },
   budgetAmountWrapper: {
     flexDirection: "row",
@@ -1166,15 +1445,35 @@ const styles = StyleSheet.create({
   },
   currencySymbol: {
     color: "#fff",
-    fontSize: 32,
+    fontSize: 36,
     fontWeight: "400",
-    marginRight: 4,
+    marginRight: 6,
+    opacity: 0.95,
   },
   budgetAmount: {
     color: "#fff",
     fontSize: 56,
     fontWeight: "300",
-    letterSpacing: -1,
+    letterSpacing: -1.5,
+    textShadowColor: "rgba(0, 0, 0, 0.1)",
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 4,
+  },
+  warningBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(255, 82, 82, 0.2)",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    marginTop: 8,
+    alignSelf: "flex-start",
+  },
+  warningText: {
+    color: "#FFEBEE",
+    fontSize: 12,
+    fontWeight: "600",
+    marginLeft: 6,
   },
   summaryContainer: {
     flexDirection: "row",
@@ -1189,6 +1488,16 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     padding: 12,
   },
+  summaryCardEnhanced: {
+    backgroundColor: "rgba(255, 255, 255, 0.25)",
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.3)",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
   summaryIconWrapper: {
     width: 40,
     height: 40,
@@ -1197,6 +1506,16 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
   },
+  summaryIconEnhanced: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 4,
+    elevation: 2,
+  },
   summaryInfo: {
     marginLeft: 12,
     flex: 1,
@@ -1204,57 +1523,108 @@ const styles = StyleSheet.create({
   summaryLabel: {
     color: "rgba(255, 255, 255, 0.9)",
     fontSize: 12,
-    marginBottom: 2,
+    marginBottom: 4,
+    fontWeight: "500",
   },
   summaryAmount: {
     color: "#fff",
-    fontSize: 16,
-    fontWeight: "600",
+    fontSize: 17,
+    fontWeight: "700",
+    letterSpacing: 0.3,
+  },
+  summaryTrend: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "rgba(244, 67, 54, 0.15)",
+    justifyContent: "center",
+    alignItems: "center",
+    marginLeft: 8,
   },
   whiteSection: {
     backgroundColor: "#fff",
     paddingHorizontal: 20,
-    paddingVertical: 20,
-    marginTop: -10,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
+    paddingVertical: 24,
+    marginTop: -12,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
     shadowColor: "#000",
-    shadowOffset: { width: 0, height: -2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 8,
-    elevation: 3,
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.08,
+    shadowRadius: 12,
+    elevation: 5,
   },
   budgetSettingHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    marginBottom: 12,
+    marginBottom: 16,
+  },
+  budgetTitleWrapper: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
   },
   budgetSettingTitle: {
-    fontSize: 16,
+    fontSize: 17,
     color: "#212121",
-    fontWeight: "600",
+    fontWeight: "700",
+    marginLeft: 8,
+  },
+  settingsButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    backgroundColor: "#F5F5F5",
   },
   budgetSettingLink: {
-    fontSize: 14,
+    fontSize: 13,
     color: "#1E88E5",
-    fontWeight: "500",
+    fontWeight: "600",
+  },
+  budgetBarContainer: {
+    marginTop: 4,
   },
   budgetBar: {
-    height: 10,
+    height: 12,
     backgroundColor: "#E3F2FD",
-    borderRadius: 5,
+    borderRadius: 6,
     overflow: "hidden",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+    elevation: 1,
   },
   budgetBarFill: {
     height: "100%",
     width: "0%",
     backgroundColor: "#42A5F5",
+    borderRadius: 6,
+    shadowColor: "#42A5F5",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  budgetInfoRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginTop: 10,
   },
   budgetBarText: {
-    fontSize: 12,
-    color: "#9E9E9E",
-    marginTop: 8,
+    fontSize: 13,
+    color: "#757575",
+    fontWeight: "600",
+  },
+  budgetRemainingText: {
+    fontSize: 13,
+    color: "#4CAF50",
+    fontWeight: "600",
   },
   emptyContainer: {
     flex: 1,
@@ -1368,43 +1738,65 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     justifyContent: "space-around",
     alignItems: "center",
-    paddingVertical: 10,
+    paddingVertical: 12,
     paddingHorizontal: 16,
+    paddingBottom: 20,
     backgroundColor: "#fff",
     borderTopWidth: 1,
-    borderTopColor: "#EEEEEE",
+    borderTopColor: "#F0F0F0",
     shadowColor: "#000",
-    shadowOffset: { width: 0, height: -2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 8,
-    elevation: 8,
+    shadowOffset: { width: 0, height: -4 },
+    shadowOpacity: 0.08,
+    shadowRadius: 12,
+    elevation: 10,
   },
   navItem: {
     alignItems: "center",
     position: "relative",
     paddingHorizontal: 12,
-    paddingVertical: 6,
+    paddingVertical: 8,
+    flex: 1,
+  },
+  navIconWrapper: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "transparent",
+  },
+  navIconActive: {
+    backgroundColor: "rgba(33, 150, 243, 0.1)",
   },
   navLabel: {
     fontSize: 11,
     color: "#9E9E9E",
-    marginTop: 4,
+    marginTop: 6,
     fontWeight: "500",
   },
   addButton: {
     // ĐÃ XÓA backgroundColor: '#1E88E5'
-    width: 56,
-    height: 56,
-    borderRadius: 28,
+    width: 64,
+    height: 64,
+    borderRadius: 32,
     justifyContent: "center",
     alignItems: "center",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 8,
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.35,
+    shadowRadius: 12,
+    elevation: 12,
     position: "absolute",
     right: 20,
-    bottom: 70,
+    bottom: 80,
+    borderWidth: 4,
+    borderColor: "#fff",
+  },
+  addButtonInner: {
+    width: "100%",
+    height: "100%",
+    borderRadius: 32,
+    justifyContent: "center",
+    alignItems: "center",
   },
   modalOverlay: {
     flex: 1,
@@ -1513,33 +1905,51 @@ const styles = StyleSheet.create({
   categoryItem: {
     flexDirection: "row",
     alignItems: "center",
-    paddingVertical: 14,
-    paddingHorizontal: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 16,
     backgroundColor: "#FAFAFA",
-    borderRadius: 12,
-    marginBottom: 10,
-  },
-  categoryIcon: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    justifyContent: "center",
-    alignItems: "center",
-    marginRight: 14,
+    borderRadius: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#F0F0F0",
     shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 3,
     elevation: 2,
   },
-  categoryName: {
+  categoryIcon: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    justifyContent: "center",
+    alignItems: "center",
+    marginRight: 16,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  categoryInfo: {
     flex: 1,
-    fontSize: 15,
+  },
+  categoryName: {
+    fontSize: 16,
     color: "#212121",
+    fontWeight: "600",
+    marginBottom: 4,
+  },
+  categoryType: {
+    fontSize: 12,
+    color: "#9E9E9E",
     fontWeight: "500",
   },
+  categoryAction: {
+    paddingLeft: 8,
+  },
   categoryArrow: {
-    marginLeft: 8,
+    marginLeft: 0,
   },
   emptyCategoryContainer: {
     alignItems: "center",

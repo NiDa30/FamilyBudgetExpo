@@ -276,123 +276,178 @@ class SyncEngine {
 
     let pulledCount = 0;
 
+    // Retry helper function
+    const retryDbOperation = async (operation, maxRetries = 3, delay = 100) => {
+      for (let i = 0; i < maxRetries; i++) {
+        try {
+          return await operation();
+        } catch (error) {
+          const errorMessage = error?.message || String(error);
+          if (
+            (errorMessage.includes("database is locked") ||
+              errorMessage.includes("finalizeAsync")) &&
+            i < maxRetries - 1
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+            continue;
+          }
+          throw error;
+        }
+      }
+      throw new Error("Max retries exceeded");
+    };
+
     try {
       const remoteCategories = await FirebaseService.getCategories(userId);
 
       for (const remote of remoteCategories) {
-        const localCategory = await DatabaseService.db.getFirstAsync(
-          "SELECT * FROM categories WHERE id = ?",
-          [remote.categoryID || remote.id]
-        );
-
-        if (!localCategory) {
-          // Category từ thiết bị khác
-          await DatabaseService.addCategory({
-            id: remote.categoryID || remote.id,
-            user_id: userId,
-            name: remote.name,
-            type: remote.type,
-            budget_group: remote.budget_group || "Nhu cầu",
-            icon: remote.icon,
-            color: remote.color,
-            is_system_default: remote.isSystemDefault ? 1 : 0,
-            updated_at: remote.updatedAt || remote.createdAt || Date.now(),
+        try {
+          const localCategory = await retryDbOperation(async () => {
+            return await DatabaseService.db.getFirstAsync(
+              "SELECT * FROM categories WHERE id = ?",
+              [remote.categoryID || remote.id]
+            );
           });
 
-          await DatabaseService.markAsSynced(
-            "categories",
-            remote.categoryID || remote.id
-          );
-          pulledCount++;
-          console.log(`✓ Pulled: ${remote.name}`);
-        } else {
-          // Kiểm tra conflict
-          const remoteTime = remote.updatedAt || remote.createdAt || 0;
-          const localTime = localCategory.updated_at || 0;
+          if (!localCategory) {
+            // Category từ thiết bị khác
+            await retryDbOperation(async () => {
+              await DatabaseService.addCategory({
+                id: remote.categoryID || remote.id,
+                user_id: userId,
+                name: remote.name,
+                type: remote.type,
+                budget_group: remote.budget_group || "Nhu cầu",
+                icon: remote.icon,
+                color: remote.color,
+                is_system_default: remote.isSystemDefault ? 1 : 0,
+                updated_at: remote.updatedAt || remote.createdAt || Date.now(),
+              });
 
-          if (remoteTime > localTime) {
-            const hasChanges =
-              localCategory.name !== remote.name ||
-              localCategory.icon !== remote.icon ||
-              localCategory.color !== remote.color;
-
-            if (hasChanges) {
-              await DatabaseService.updateCategory(
-                remote.categoryID || remote.id,
-                {
-                  name: remote.name,
-                  icon: remote.icon,
-                  color: remote.color,
-                  updated_at: remoteTime,
-                }
+              await DatabaseService.markAsSynced(
+                "categories",
+                remote.categoryID || remote.id
               );
-              console.log(`✓ Updated: ${remote.name}`);
-            }
-          }
+            });
+            pulledCount++;
+            console.log(`✓ Pulled: ${remote.name}`);
+          } else {
+            // Kiểm tra conflict
+            const remoteTime = remote.updatedAt || remote.createdAt || 0;
+            const localTime = localCategory.updated_at || 0;
 
-          // Luôn mark as synced
-          await DatabaseService.markAsSynced(
-            "categories",
-            remote.categoryID || remote.id
-          );
+            if (remoteTime > localTime) {
+              const hasChanges =
+                localCategory.name !== remote.name ||
+                localCategory.icon !== remote.icon ||
+                localCategory.color !== remote.color;
+
+              if (hasChanges) {
+                await retryDbOperation(async () => {
+                  await DatabaseService.updateCategory(
+                    remote.categoryID || remote.id,
+                    {
+                      name: remote.name,
+                      icon: remote.icon,
+                      color: remote.color,
+                      updated_at: remoteTime,
+                    }
+                  );
+                });
+                console.log(`✓ Updated: ${remote.name}`);
+              }
+            }
+
+            // Luôn mark as synced
+            await retryDbOperation(async () => {
+              await DatabaseService.markAsSynced(
+                "categories",
+                remote.categoryID || remote.id
+              );
+            });
+          }
+        } catch (error) {
+          const errorMessage = error?.message || String(error);
+          if (!errorMessage.includes("database is locked")) {
+            console.warn(`Failed to sync category ${remote.categoryID || remote.id}:`, error);
+          }
         }
+        // Small delay between operations
+        await new Promise((resolve) => setTimeout(resolve, 10));
       }
 
       const remoteTransactions = await FirebaseService.getTransactions(userId);
 
       for (const remote of remoteTransactions) {
-        const localTransaction = await DatabaseService.db.getFirstAsync(
-          "SELECT * FROM transactions WHERE id = ?",
-          [remote.transactionID || remote.id]
-        );
-
-        if (!localTransaction) {
-          await DatabaseService.addTransaction({
-            id: remote.transactionID || remote.id,
-            user_id: userId,
-            category_id: remote.categoryID,
-            amount: remote.amount,
-            type: remote.type,
-            description: remote.description,
-            date: remote.date,
-            payment_method: remote.paymentMethod,
-            merchant_name: remote.merchantName,
-            last_modified_at:
-              remote.updatedAt || remote.createdAt || Date.now(),
+        try {
+          const localTransaction = await retryDbOperation(async () => {
+            return await DatabaseService.db.getFirstAsync(
+              "SELECT * FROM transactions WHERE id = ?",
+              [remote.transactionID || remote.id]
+            );
           });
 
-          await DatabaseService.markAsSynced(
-            "transactions",
-            remote.transactionID || remote.id
-          );
-          pulledCount++;
-        } else {
-          const remoteTime = remote.updatedAt || remote.createdAt || 0;
-          const localTime = localTransaction.last_modified_at || 0;
+          if (!localTransaction) {
+            await retryDbOperation(async () => {
+              await DatabaseService.addTransaction({
+                id: remote.transactionID || remote.id,
+                user_id: userId,
+                category_id: remote.categoryID,
+                amount: remote.amount,
+                type: remote.type,
+                description: remote.description,
+                date: remote.date,
+                payment_method: remote.paymentMethod,
+                merchant_name: remote.merchantName,
+                last_modified_at:
+                  remote.updatedAt || remote.createdAt || Date.now(),
+              });
 
-          if (remoteTime > localTime) {
-            const hasChanges =
-              localTransaction.amount !== remote.amount ||
-              localTransaction.description !== remote.description;
-
-            if (hasChanges) {
-              await DatabaseService.updateTransaction(
-                remote.transactionID || remote.id,
-                {
-                  category_id: remote.categoryID,
-                  amount: remote.amount,
-                  description: remote.description,
-                  last_modified_at: remoteTime,
-                }
+              await DatabaseService.markAsSynced(
+                "transactions",
+                remote.transactionID || remote.id
               );
-            }
-          }
+            });
+            pulledCount++;
+          } else {
+            const remoteTime = remote.updatedAt || remote.createdAt || 0;
+            const localTime = localTransaction.last_modified_at || 0;
 
-          await DatabaseService.markAsSynced(
-            "transactions",
-            remote.transactionID || remote.id
-          );
+            if (remoteTime > localTime) {
+              const hasChanges =
+                localTransaction.amount !== remote.amount ||
+                localTransaction.description !== remote.description;
+
+              if (hasChanges) {
+                await retryDbOperation(async () => {
+                  await DatabaseService.updateTransaction(
+                    remote.transactionID || remote.id,
+                    {
+                      category_id: remote.categoryID,
+                      amount: remote.amount,
+                      description: remote.description,
+                      last_modified_at: remoteTime,
+                    }
+                  );
+                });
+              }
+            }
+
+            await retryDbOperation(async () => {
+              await DatabaseService.markAsSynced(
+                "transactions",
+                remote.transactionID || remote.id
+              );
+            });
+          }
+        } catch (error) {
+          const errorMessage = error?.message || String(error);
+          if (!errorMessage.includes("database is locked")) {
+            console.warn(`Failed to sync transaction ${remote.transactionID || remote.id}:`, error);
+          }
         }
+        // Small delay between operations
+        await new Promise((resolve) => setTimeout(resolve, 10));
       }
 
       if (pulledCount > 0) {
@@ -403,8 +458,12 @@ class SyncEngine {
 
       return { pulledCount };
     } catch (error) {
-      console.error("❌ Pull failed:", error);
-      throw error;
+      const errorMessage = error?.message || String(error);
+      if (!errorMessage.includes("database is locked")) {
+        console.error("❌ Pull failed:", error);
+      }
+      // Don't throw - allow app to continue
+      return { pulledCount: 0 };
     }
   }
 

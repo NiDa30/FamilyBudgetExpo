@@ -129,10 +129,10 @@ class DatabaseService {
 
   async getCategoriesByUser(userId) {
     await this.ensureInitialized();
-    
+
     // Note: Duplicate removal is handled during sync, not here to avoid performance issues
     // If duplicates exist, they will be removed during the next sync operation
-    
+
     return await this.db.getAllAsync(
       `SELECT * FROM categories 
        WHERE user_id = ? AND deleted_at IS NULL 
@@ -170,7 +170,7 @@ class DatabaseService {
 
   async createCategory(category) {
     await this.ensureInitialized();
-    
+
     // Check if category with same name+type+user already exists (by name, not ID)
     const existingId = await this.categoryExistsByName(
       category.user_id,
@@ -182,7 +182,9 @@ class DatabaseService {
       // Category with same name+type already exists with different ID
       // Update the existing one instead of creating duplicate
       console.log(
-        `⚠️ Category "${category.name}" (${category.type || "EXPENSE"}) already exists with ID ${existingId}, updating instead of creating duplicate`
+        `⚠️ Category "${category.name}" (${
+          category.type || "EXPENSE"
+        }) already exists with ID ${existingId}, updating instead of creating duplicate`
       );
       await this.updateCategory(existingId, {
         icon: category.icon || "food-apple",
@@ -241,7 +243,11 @@ class DatabaseService {
     };
 
     Object.keys(updates).forEach((key) => {
-      if (key !== "updated_at" && key !== "is_synced" && updates[key] !== undefined) {
+      if (
+        key !== "updated_at" &&
+        key !== "is_synced" &&
+        updates[key] !== undefined
+      ) {
         const dbColumn = columnMap[key] || key;
         fields.push(`${dbColumn} = ?`);
         values.push(updates[key]);
@@ -272,18 +278,18 @@ class DatabaseService {
    */
   async removeDuplicateCategories(userId) {
     await this.ensureInitialized();
-    
+
     // Prevent concurrent execution
     if (this._removingDuplicates) {
       return 0;
     }
-    
+
     this._removingDuplicates = true;
-    
+
     try {
       // Use a single transaction to avoid database locking issues
       await this.db.execAsync("BEGIN TRANSACTION");
-      
+
       try {
         // Find duplicate categories grouped by name, user_id, and type
         const duplicates = await this.db.getAllAsync(
@@ -323,7 +329,7 @@ class DatabaseService {
                WHERE id IN (${placeholders})`,
               [now, now, ...deleteIds]
             );
-            
+
             deletedCount += deleteIds.length;
 
             if (deleteIds.length > 0) {
@@ -337,7 +343,9 @@ class DatabaseService {
         await this.db.execAsync("COMMIT");
 
         if (deletedCount > 0) {
-          console.log(`✅ Removed ${deletedCount} duplicate categories for user ${userId}`);
+          console.log(
+            `✅ Removed ${deletedCount} duplicate categories for user ${userId}`
+          );
         }
 
         return deletedCount;
@@ -416,12 +424,15 @@ class DatabaseService {
 
     try {
       // Check if is_deleted column exists
-      const tableInfo = await this.db.getAllAsync("PRAGMA table_info(transactions)");
+      const tableInfo = await this.db.getAllAsync(
+        "PRAGMA table_info(transactions)"
+      );
       const hasIsDeleted = tableInfo.some((col) => col.name === "is_deleted");
-      
+
       let deletedFilter = "t.deleted_at IS NULL";
       if (hasIsDeleted) {
-        deletedFilter = "(t.is_deleted IS NULL OR t.is_deleted = 0) AND t.deleted_at IS NULL";
+        deletedFilter =
+          "(t.is_deleted IS NULL OR t.is_deleted = 0) AND t.deleted_at IS NULL";
       }
 
       let query = `
@@ -455,7 +466,10 @@ class DatabaseService {
       return await this.db.getAllAsync(query, params);
     } catch (error) {
       // Fallback if is_deleted column doesn't exist
-      if (error?.message?.includes("is_deleted") || error?.message?.includes("no such column")) {
+      if (
+        error?.message?.includes("is_deleted") ||
+        error?.message?.includes("no such column")
+      ) {
         let query = `
           SELECT t.*, c.name as category_name, c.icon as category_icon, c.color as category_color
           FROM transactions t
@@ -803,7 +817,9 @@ export async function ensureCategoriesInitialized(userId) {
     await databaseService.ensureInitialized();
 
     // Check if user has any categories
-    const existingCategories = await databaseService.getCategoriesByUser(userId);
+    const existingCategories = await databaseService.getCategoriesByUser(
+      userId
+    );
 
     if (existingCategories && existingCategories.length > 0) {
       console.log(
@@ -812,7 +828,8 @@ export async function ensureCategoriesInitialized(userId) {
 
       // Check if any categories need Firebase sync (only user categories, not default ones)
       const unsyncedCategories = existingCategories.filter(
-        (cat) => (!cat.is_synced || cat.is_synced === 0) && cat.is_system_default !== 1
+        (cat) =>
+          (!cat.is_synced || cat.is_synced === 0) && cat.is_system_default !== 1
       );
 
       if (unsyncedCategories.length > 0 && userId) {
@@ -859,7 +876,9 @@ export async function ensureCategoriesInitialized(userId) {
           // Log batch results
           if (syncedCount > 0) {
             console.log(
-              `✅ Synced ${syncedCount} user categories to Firebase${failedCount > 0 ? ` (${failedCount} failed)` : ""}`
+              `✅ Synced ${syncedCount} user categories to Firebase${
+                failedCount > 0 ? ` (${failedCount} failed)` : ""
+              }`
             );
           }
         } catch (firebaseError) {
