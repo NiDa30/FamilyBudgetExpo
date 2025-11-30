@@ -1,10 +1,34 @@
 import { Transaction, Category, User } from "./types";
 
 export function mapRowToTransaction(row: any): Transaction {
+  // ✅ 改善: 複数のフィールド名からcategoryIdを取得（JOIN結果も考慮）
+  // 優先順位: transaction_category_id > category_id_from_join > category_id > categoryID > categoryId
+  const categoryId = row.transaction_category_id || 
+                     row.category_id_from_join || 
+                     row.category_id || 
+                     row.categoryID || 
+                     row.categoryId || 
+                     null;
+  
+  // ✅ デバッグ: 最初の数件でマッピングを確認
+  if (row.id && typeof row.id === 'string' && row.id.includes('_')) {
+    const isFirstFew = parseInt(row.id.split('_').pop() || '0', 16) % 100 < 3;
+    if (isFirstFew) {
+      console.log(`🔍 mapRowToTransaction debug:`, {
+        id: row.id,
+        transaction_category_id: row.transaction_category_id,
+        category_id_from_join: row.category_id_from_join,
+        category_id: row.category_id,
+        category_name: row.category_name,
+        mapped_categoryId: categoryId,
+      });
+    }
+  }
+  
   return {
     id: row.id,
     userId: row.user_id,
-    categoryId: row.category_id ?? null,
+    categoryId: categoryId,
     amount: row.amount,
     type: row.type,
     date: row.date,
@@ -65,6 +89,7 @@ export function mapRowToUser(row: any): User {
 }
 
 export function mapTransactionToDb(txn: Transaction) {
+  const now = new Date().toISOString();
   return {
     id: txn.id,
     user_id: txn.userId,
@@ -81,6 +106,7 @@ export function mapTransactionToDb(txn: Transaction) {
     tags: txn.tags ? txn.tags.join(",") : null,
     is_synced: txn.isSynced ? 1 : 0,
     last_modified_at: txn.lastModifiedAt ?? null,
+    updated_at: txn.lastModifiedAt || txn.createdAt || now, // ✅ Đảm bảo có updated_at
     is_deleted: txn.isDeleted ? 1 : 0,
     deleted_at: txn.deletedAt ?? null,
     created_at: txn.createdAt ?? null,

@@ -14,6 +14,7 @@ import {
   ActivityIndicator,
   Alert,
 } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { RootStackParamList } from "../App";
 import { useTheme } from "./context/ThemeContext";
@@ -222,6 +223,9 @@ const MenuScreen = () => {
           style: "destructive",
           onPress: async () => {
             try {
+              // ✅ セッションをクリア
+              await AsyncStorage.removeItem("@user_session");
+              // Firebaseからサインアウト
               await signOut(auth);
               navigation.navigate("Login");
             } catch (error) {

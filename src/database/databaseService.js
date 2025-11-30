@@ -436,7 +436,13 @@ class DatabaseService {
       }
 
       let query = `
-        SELECT t.*, c.name as category_name, c.icon as category_icon, c.color as category_color
+        SELECT t.*, 
+               t.category_id as transaction_category_id,
+               c.id as category_id_from_join,
+               c.name as category_name, 
+               c.icon as category_icon, 
+               c.color as category_color,
+               c.type as category_type
         FROM transactions t
         LEFT JOIN categories c ON t.category_id = c.id
         WHERE t.user_id = ? AND ${deletedFilter}
@@ -461,7 +467,7 @@ class DatabaseService {
         params.push(options.categoryId);
       }
 
-      query += " ORDER BY t.date DESC";
+      query += " GROUP BY t.id ORDER BY t.date DESC";
 
       return await this.db.getAllAsync(query, params);
     } catch (error) {
@@ -471,7 +477,13 @@ class DatabaseService {
         error?.message?.includes("no such column")
       ) {
         let query = `
-          SELECT t.*, c.name as category_name, c.icon as category_icon, c.color as category_color
+          SELECT t.*, 
+                 t.category_id as transaction_category_id,
+                 c.id as category_id_from_join,
+                 c.name as category_name, 
+                 c.icon as category_icon, 
+                 c.color as category_color,
+                 c.type as category_type
           FROM transactions t
           LEFT JOIN categories c ON t.category_id = c.id
           WHERE t.user_id = ? AND t.deleted_at IS NULL
@@ -495,7 +507,7 @@ class DatabaseService {
           params.push(options.categoryId);
         }
 
-        query += " ORDER BY t.date DESC";
+        query += " GROUP BY t.id ORDER BY t.date DESC";
 
         return await this.db.getAllAsync(query, params);
       }

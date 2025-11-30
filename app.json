@@ -7,7 +7,6 @@
     "icon": "./assets/images/icon.png",
     "scheme": "familybudgetexpo",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": false,
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.quocdien.familybudget"
@@ -22,7 +21,9 @@
       "package": "com.quocdien.familybudget",
       "permissions": [
         "CAMERA",
-        "READ_EXTERNAL_STORAGE"
+        "READ_EXTERNAL_STORAGE",
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE"
       ]
     },
     "web": {
@@ -46,7 +47,8 @@
       "expo-web-browser",
       "expo-font",
       "expo-asset",
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-notifications"
     ],
     "experiments": {
       "typedRoutes": true

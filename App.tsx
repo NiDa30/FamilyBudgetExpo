@@ -1,6 +1,10 @@
 import { NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { SafeAreaProvider } from "react-native-safe-area-context";
+import { useEffect, useState } from "react";
+import { ActivityIndicator, View, StyleSheet } from "react-native";
+import { onAuthStateChanged } from "firebase/auth";
+import { authInstance as auth } from "./src/firebaseConfig";
 
 import Bieudo from "./src/Bieudo";
 import Doimatkhau from "./src/Doimatkhau";
@@ -21,7 +25,10 @@ import TuyChinhMauSac from "./src/TuyChinhMauSac";
 import Veungdung from "./src/Veungdung";
 import XuatExcel from "./src/XuatExcel";
 import { ThemeProvider } from "./src/context/ThemeContext";
+import { SharedDataProvider } from "./src/context/SharedDataContext";
 import BudgetDashboardScreen from "./src/screens/Trangchu/BudgetDashboardScreen";
+import NotificationSettingsScreen from "./src/screens/notification/NotificationSettings";
+import BudgetSetupScreen from "./src/screens/budget/BudgetSetupScreen";
 
 export type RootStackParamList = {
   Trangchu: undefined;
@@ -47,6 +54,8 @@ export type RootStackParamList = {
   Veungdung: undefined;
   XuatExcel: undefined;
   BudgetDashboard: undefined;
+  NotificationSettings: undefined;
+  BudgetSetup: undefined;
 };
 
 export type Category = {
@@ -60,11 +69,43 @@ export type Category = {
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
 export default function App() {
+  const [isLoading, setIsLoading] = useState(true);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+
+  useEffect(() => {
+    // ✅ アプリ起動時に認証状態をチェック
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        console.log("✅ User is authenticated:", user.email);
+        setIsAuthenticated(true);
+      } else {
+        console.log("ℹ️ User is not authenticated");
+        setIsAuthenticated(false);
+      }
+      setIsLoading(false);
+    });
+
+    // クリーンアップ
+    return () => unsubscribe();
+  }, []);
+
+  // ローディング中はスプラッシュ画面を表示
+  if (isLoading) {
+    return (
+      <SafeAreaProvider>
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color="#4A90E2" />
+        </View>
+      </SafeAreaProvider>
+    );
+  }
+
   return (
     <SafeAreaProvider>
       <ThemeProvider>
-        <NavigationContainer>
-          <Stack.Navigator initialRouteName="Login">
+        <SharedDataProvider>
+          <NavigationContainer>
+          <Stack.Navigator initialRouteName={isAuthenticated ? "Trangchu" : "Login"}>
             <Stack.Screen
               name="Login"
               component={Login}
@@ -165,9 +206,29 @@ export default function App() {
               component={BudgetDashboardScreen}
               options={{ headerShown: false }}
             />
+            <Stack.Screen
+              name="NotificationSettings"
+              component={NotificationSettingsScreen}
+              options={{ headerShown: false }}
+            />
+            <Stack.Screen
+              name="BudgetSetup"
+              component={BudgetSetupScreen}
+              options={{ headerShown: false }}
+            />
           </Stack.Navigator>
-        </NavigationContainer>
+          </NavigationContainer>
+        </SharedDataProvider>
       </ThemeProvider>
     </SafeAreaProvider>
   );
 }
+
+const styles = StyleSheet.create({
+  loadingContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#ffffff",
+  },
+});

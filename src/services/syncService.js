@@ -178,6 +178,7 @@ class SyncService {
     const mapping = {
       USER: "USER",
       CATEGORIES: "CATEGORY", // Firestore uses CATEGORIES, SQLite uses CATEGORY
+      CATEGORIES_DEFAULT: "CATEGORY_DEFAULT", // Firestore uses CATEGORIES_DEFAULT, SQLite uses CATEGORY_DEFAULT
       TRANSACTIONS: "TRANSACTION", // Firestore uses TRANSACTIONS, SQLite uses TRANSACTION
       BUDGET: "BUDGET",
       GOAL: "GOAL",
@@ -185,6 +186,7 @@ class SyncService {
       BUDGET_HISTORY: "BUDGET_HISTORY",
       GOAL_CONTRIBUTION: "GOAL_CONTRIBUTION",
       SYNC_LOG: "SYNC_LOG",
+      ACTIVITY_LOG: "ACTIVITY_LOG", // Added
       NOTIFICATION: "NOTIFICATION",
       DEVICE: "DEVICE",
       ATTACHMENT: "ATTACHMENT",
@@ -196,7 +198,7 @@ class SyncService {
       REPORT: "REPORT",
       APP_SETTINGS: "APP_SETTINGS",
       CATEGORY_BUDGET_TEMPLATE: "CATEGORY_BUDGET_TEMPLATE",
-      expenses: "expenses", // If this collection exists
+      expenses: "EXPENSES", // Firestore lowercase, SQLite uppercase
     };
 
     return mapping[collectionName] || collectionName;
@@ -209,6 +211,7 @@ class SyncService {
     const primaryKeys = {
       USER: "userID",
       CATEGORY: "categoryID",
+      CATEGORY_DEFAULT: "categoryID", // Added
       TRANSACTION: "transactionID",
       BUDGET: "budgetID",
       GOAL: "goalID",
@@ -216,6 +219,7 @@ class SyncService {
       BUDGET_HISTORY: "historyID",
       GOAL_CONTRIBUTION: "contributionID",
       SYNC_LOG: "logID",
+      ACTIVITY_LOG: "logID", // Added
       NOTIFICATION: "notificationID",
       DEVICE: "deviceID",
       ATTACHMENT: "attachmentID",
@@ -227,6 +231,7 @@ class SyncService {
       REPORT: "reportID",
       APP_SETTINGS: "settingID",
       CATEGORY_BUDGET_TEMPLATE: "templateID",
+      EXPENSES: "expenseID", // Added
     };
 
     return primaryKeys[tableName] || "id";
@@ -262,6 +267,7 @@ class SyncService {
     const tables = [
       "USER",
       "CATEGORY",
+      "CATEGORY_DEFAULT", // Added
       "TRANSACTION",
       "BUDGET",
       "GOAL",
@@ -269,6 +275,7 @@ class SyncService {
       "BUDGET_HISTORY",
       "GOAL_CONTRIBUTION",
       "SYNC_LOG",
+      "ACTIVITY_LOG", // Added
       "NOTIFICATION",
       "DEVICE",
       "ATTACHMENT",
@@ -280,6 +287,7 @@ class SyncService {
       "REPORT",
       "APP_SETTINGS",
       "CATEGORY_BUDGET_TEMPLATE",
+      "EXPENSES", // Added
     ];
 
     const unsynced = {};

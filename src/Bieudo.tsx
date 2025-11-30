@@ -27,13 +27,20 @@ import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { RootStackParamList } from "../App";
 import { BudgetAndGoalsOverview } from "./components/budget";
 import { BarChart, LineChart, PieChart } from "./components/charts";
+import {
+  SummaryHeader,
+  ChartsScreen,
+  StatisticsScreen,
+  BudgetScreen,
+} from "./components/report";
 import { COLLECTIONS } from "./constants/collections";
 import { useTheme } from "./context/ThemeContext";
 import { auth, db } from "./firebaseConfig";
 import { AnalyticsService } from "./service/analytics/AnalyticsService";
 import databaseService from "./database/databaseService";
-import { Category } from "./domain/types";
+import { Category, Transaction } from "./domain/types";
 import { CategoryRepository } from "./database/repositories";
+import { mapRowToTransaction } from "./domain/mappers";
 import * as FileSystem from "expo-file-system";
 import * as Sharing from "expo-sharing";
 
@@ -123,7 +130,9 @@ const ChartScreen = () => {
         break;
       case "month":
         start = new Date(now.getFullYear(), now.getMonth(), 1);
+        start.setHours(0, 0, 0, 0);
         end = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59);
+        end.setMilliseconds(999);
         break;
       case "quarter":
         const quarter = Math.floor(now.getMonth() / 3);
@@ -163,7 +172,9 @@ const ChartScreen = () => {
               errorMessage.includes("finalizeAsync")) &&
             i < maxRetries - 1
           ) {
-            await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+            await new Promise((resolve) =>
+              setTimeout(resolve, delay * (i + 1))
+            );
             continue;
           }
           throw error;
@@ -188,7 +199,9 @@ const ChartScreen = () => {
               errorMessage.includes("finalizeAsync")) &&
             i < maxRetries - 1
           ) {
-            await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+            await new Promise((resolve) =>
+              setTimeout(resolve, delay * (i + 1))
+            );
             continue;
           }
           throw error;
@@ -213,15 +226,23 @@ const ChartScreen = () => {
       // ✅ Load categories: Default from Firebase CATEGORIES_DEFAULT + User from SQLite
       try {
         console.log("📋 Loading combined categories (default + user)...");
-        
+
         // Use CategoryService to get combined categories (default from Firebase + user from SQLite)
-        const CategoryService = (await import("./services/categoryService")).default;
-        const combinedCategories = await CategoryService.getCombinedCategories(user.uid);
-        
-        console.log(`📋 Loaded ${combinedCategories.length} combined categories`);
-        
-        if (Array.isArray(combinedCategories) && combinedCategories.length > 0) {
-          setCategories(combinedCategories);
+        const CategoryService = (await import("./services/categoryService"))
+          .default;
+        const combinedCategories = await CategoryService.getCombinedCategories(
+          user.uid
+        );
+
+        console.log(
+          `📋 Loaded ${combinedCategories.length} combined categories`
+        );
+
+        if (
+          Array.isArray(combinedCategories) &&
+          combinedCategories.length > 0
+        ) {
+          setCategories(combinedCategories as Category[]);
         } else {
           console.warn("⚠️ No categories found, trying fallback...");
           // Fallback: Load from SQLite only
@@ -261,7 +282,8 @@ const ChartScreen = () => {
           });
           setCategories(cats);
         } catch (fallbackError: any) {
-          const fallbackErrorMessage = fallbackError?.message || String(fallbackError);
+          const fallbackErrorMessage =
+            fallbackError?.message || String(fallbackError);
           if (!fallbackErrorMessage.includes("database is locked")) {
             console.error(
               "Failed to load categories from repository:",
@@ -282,41 +304,115 @@ const ChartScreen = () => {
         options.categoryId = selectedCategoryFilter;
       }
 
-      const allTransactions = await retryDbOperation(async () => {
+      // Try to load without date filter first to debug
+      const allTransactionsRawNoFilter = await retryDbOperation(async () => {
+        return await databaseService.getTransactionsByUser(user.uid, {});
+      });
+      console.log(
+        `📊 Total transactions in SQLite (no filter): ${
+          allTransactionsRawNoFilter?.length || 0
+        }`
+      );
+      if (allTransactionsRawNoFilter && allTransactionsRawNoFilter.length > 0) {
+        console.log(
+          `📊 Sample transaction date:`,
+          allTransactionsRawNoFilter[0].date
+        );
+      }
+
+      const allTransactionsRaw = await retryDbOperation(async () => {
         return await databaseService.getTransactionsByUser(user.uid, options);
       });
 
+      // Ensure allTransactionsRaw is an array
+      if (!Array.isArray(allTransactionsRaw)) {
+        console.warn(
+          "getTransactionsByUser returned non-array:",
+          allTransactionsRaw
+        );
+        setLoading(false);
+        return;
+      }
+
+      // Map database rows to Transaction objects (like Timkiem.tsx)
+      const allTransactions: Transaction[] = allTransactionsRaw.map(
+        (row: any) => {
+          const mapped = mapRowToTransaction(row);
+          // ✅ デバッグ: 最初の数件の取引のカテゴリIDを確認
+          if (allTransactionsRaw.indexOf(row) < 5) {
+            console.log(`📊 Transaction mapping [${allTransactionsRaw.indexOf(row)}]:`, {
+              row_category_id: row.category_id,
+              row_categoryID: row.categoryID,
+              row_category_id_from_join: row.category_id_from_join,
+              row_category_name: row.category_name,
+              mapped_categoryId: mapped.categoryId,
+              row_id: row.id,
+              row_type: row.type,
+            });
+          }
+          return mapped;
+        }
+      );
+      
+      // ✅ デバッグ: カテゴリIDの統計を確認
+      const categoryIdStats = {
+        withCategoryId: 0,
+        withoutCategoryId: 0,
+        uniqueCategoryIds: new Set<string>(),
+      };
+      allTransactions.forEach((txn) => {
+        if (txn.categoryId) {
+          categoryIdStats.withCategoryId++;
+          categoryIdStats.uniqueCategoryIds.add(String(txn.categoryId));
+        } else {
+          categoryIdStats.withoutCategoryId++;
+        }
+      });
+      console.log(`📊 Category ID Statistics:`, {
+        withCategoryId: categoryIdStats.withCategoryId,
+        withoutCategoryId: categoryIdStats.withoutCategoryId,
+        uniqueCategoryIds: Array.from(categoryIdStats.uniqueCategoryIds).slice(0, 10),
+      });
+
       console.log(
-        `📊 Loaded ${
-          allTransactions?.length || 0
-        } transactions from SQLite for period ${selectedPeriod}`
+        `📊 Loaded ${allTransactions.length} transactions from SQLite for period ${selectedPeriod}`
       );
       console.log(`📊 Date range: ${range.start} to ${range.end}`);
-      if (allTransactions && allTransactions.length > 0) {
+      if (allTransactions.length > 0) {
         console.log(`📊 Sample transaction:`, {
           id: allTransactions[0].id,
           amount: allTransactions[0].amount,
           type: allTransactions[0].type,
           date: allTransactions[0].date,
-          category_name: allTransactions[0].category_name,
+          categoryId: allTransactions[0].categoryId,
         });
       } else {
         console.warn(`⚠️ No transactions found for period ${selectedPeriod}`);
+        // If no transactions found with filter, try without date filter to see if there are any transactions
+        if (
+          allTransactionsRawNoFilter &&
+          allTransactionsRawNoFilter.length > 0
+        ) {
+          console.warn(
+            `⚠️ But found ${allTransactionsRawNoFilter.length} transactions without date filter - date range may be incorrect`
+          );
+        }
       }
 
-      // Calculate totals from SQLite data
+      // Calculate totals from mapped Transaction objects
       let income = 0;
       let expense = 0;
-      if (Array.isArray(allTransactions)) {
-        allTransactions.forEach((txn: any) => {
-          const amount = parseFloat(txn.amount) || 0;
-          if (txn.type === "INCOME") {
-            income += amount;
-          } else if (txn.type === "EXPENSE") {
-            expense += amount;
-          }
-        });
-      }
+      allTransactions.forEach((txn: Transaction) => {
+        const amount =
+          typeof txn.amount === "number"
+            ? txn.amount
+            : parseFloat(String(txn.amount)) || 0;
+        if (txn.type === "INCOME") {
+          income += amount;
+        } else if (txn.type === "EXPENSE") {
+          expense += amount;
+        }
+      });
 
       const totals = { income, expense, balance: income - expense };
       console.log(
@@ -329,29 +425,61 @@ const ChartScreen = () => {
 
       // Check for large expenses (expenses > 10% of total income or > 1M VND)
       try {
-        const allTransactions = await retryDbOperation(async () => {
+        const expenseTransactionsRaw = await retryDbOperation(async () => {
           return await databaseService.getTransactionsByUser(user.uid, {
             startDate: range.start,
             endDate: range.end,
             type: "EXPENSE",
           });
         });
-        // Get current categories for mapping (transactions already include category_name)
-        const largeExpenses = allTransactions
-          .filter((txn: any) => {
-            const amount = txn.amount || 0;
+
+        // Map to Transaction objects
+        const expenseTransactionsMapped: Transaction[] = Array.isArray(
+          expenseTransactionsRaw
+        )
+          ? expenseTransactionsRaw.map((row: any) => mapRowToTransaction(row))
+          : [];
+
+        // Get category info helper
+        // ✅ 改善: 複数のフィールド名をチェック
+        const getCategoryInfoForExpense = (
+          categoryId: string | null | undefined
+        ) => {
+          if (!categoryId) {
+            return "Không phân loại";
+          }
+          const category = categories.find(
+            (cat) =>
+              cat.id === categoryId ||
+              cat.id === String(categoryId) ||
+              String(cat.id) === String(categoryId) ||
+              (cat as any).categoryID === categoryId ||
+              (cat as any).category_id === categoryId
+          );
+          return category?.name || "Không phân loại";
+        };
+
+        const largeExpenses = expenseTransactionsMapped
+          .filter((txn: Transaction) => {
+            const amount =
+              typeof txn.amount === "number"
+                ? txn.amount
+                : parseFloat(String(txn.amount)) || 0;
             return (
               amount > 1000000 ||
               (totals.income > 0 && amount > totals.income * 0.1)
             );
           })
-          .map((txn: any) => ({
+          .map((txn: Transaction) => ({
             id: txn.id,
             description: txn.description || "Không có mô tả",
-            amount: txn.amount,
+            amount:
+              typeof txn.amount === "number"
+                ? txn.amount
+                : parseFloat(String(txn.amount)) || 0,
             date: txn.date,
-            categoryId: txn.category_id,
-            categoryName: txn.category_name || "Không phân loại",
+            categoryId: txn.categoryId,
+            categoryName: getCategoryInfoForExpense(txn.categoryId),
           }))
           .sort((a, b) => b.amount - a.amount)
           .slice(0, 5); // Top 5 largest expenses
@@ -360,30 +488,126 @@ const ChartScreen = () => {
         console.warn("Failed to check large expenses:", error);
       }
 
-      // ✅ Calculate category distributions from SQLite data
-      const expenseTransactions = Array.isArray(allTransactions)
-        ? allTransactions.filter((t: any) => t.type === "EXPENSE")
-        : [];
-      const incomeTransactions = Array.isArray(allTransactions)
-        ? allTransactions.filter((t: any) => t.type === "INCOME")
-        : [];
+      // ✅ Calculate category distributions from mapped Transaction objects
+      const expenseTransactions = allTransactions.filter(
+        (t: Transaction) => t.type === "EXPENSE"
+      );
+      const incomeTransactions = allTransactions.filter(
+        (t: Transaction) => t.type === "INCOME"
+      );
+
+      // Get category info helper function (like Timkiem.tsx)
+      // ✅ 改善: 複数のフィールド名をチェックしてカテゴリを検索（同期処理）
+      const getCategoryInfo = (categoryId: string | null | undefined, row?: any) => {
+        if (!categoryId) {
+          return {
+            name: "Không phân loại",
+            icon: "tag",
+            color: "#9E9E9E",
+          };
+        }
+        
+        // ✅ 優先1: JOIN結果からカテゴリ情報を取得（既に取得済みの場合）
+        if (row && row.category_name) {
+          return {
+            name: row.category_name || "Không phân loại",
+            icon: row.category_icon || "tag",
+            color: row.category_color || "#9E9E9E",
+          };
+        }
+        
+        // ✅ 優先2: メモリ内のカテゴリリストから検索
+        const category = categories.find(
+          (cat) =>
+            cat.id === categoryId ||
+            cat.id === String(categoryId) ||
+            String(cat.id) === String(categoryId) ||
+            (cat as any).categoryID === categoryId ||
+            (cat as any).category_id === categoryId
+        );
+        
+        if (category) {
+          return {
+            name: category.name || "Không phân loại",
+            icon: category.icon || "tag",
+            color: category.color || "#9E9E9E",
+          };
+        }
+        
+        // カテゴリが見つからない場合
+        console.warn(`⚠️ Category not found for ID: ${categoryId}`);
+        return {
+          name: "Không phân loại",
+          icon: "tag",
+          color: "#9E9E9E",
+        };
+      };
 
       // Calculate expense distribution
       const expenseCategoryMap = new Map<
         string,
-        { amount: number; name: string; color: string; icon: string }
+        { amount: number; name: string; color: string; icon: string; categoryId: string }
       >();
-      expenseTransactions.forEach((txn: any) => {
-        const categoryId = txn.category_id || "uncategorized";
-        const categoryName = txn.category_name || "Chưa phân loại";
-        const amount = parseFloat(txn.amount) || 0;
-        const existing = expenseCategoryMap.get(categoryId) || {
+      
+      // ✅ デバッグ: 取引のカテゴリIDを確認
+      const categoryIdsInTransactions = new Set<string>();
+      const categoryIdMismatches: Array<{ txnId: string; categoryId: string | null; found: boolean }> = [];
+      
+      expenseTransactions.forEach((txn: Transaction) => {
+        const catId = txn.categoryId || (txn as any).category_id || null;
+        if (catId) {
+          categoryIdsInTransactions.add(String(catId));
+          // カテゴリが存在するか確認
+          const found = categories.some(
+            (c) => c.id === String(catId) || c.id === catId || (c as any).categoryID === catId
+          );
+          if (!found && categoryIdMismatches.length < 10) {
+            categoryIdMismatches.push({
+              txnId: txn.id,
+              categoryId: String(catId),
+              found: false,
+            });
+          }
+        }
+      });
+      
+      console.log(`📊 Found ${categoryIdsInTransactions.size} unique category IDs in expense transactions:`, Array.from(categoryIdsInTransactions).slice(0, 10));
+      console.log(`📊 Available categories: ${categories.length}`, categories.slice(0, 10).map((c) => ({ id: c.id, name: c.name, type: c.type })));
+      
+      if (categoryIdMismatches.length > 0) {
+        console.warn(`⚠️ Found ${categoryIdMismatches.length} transactions with category IDs that don't match any category:`, categoryIdMismatches.slice(0, 5));
+      }
+      
+      expenseTransactions.forEach((txn: Transaction) => {
+        // ✅ 元のrowデータを取得（JOIN結果を含む）
+        const originalRow = allTransactionsRaw.find((row: any) => row.id === txn.id);
+        
+        // ✅ 複数のフィールド名からcategoryIdを取得
+        const categoryId = txn.categoryId || 
+                          (txn as any).category_id || 
+                          (txn as any).categoryID || 
+                          originalRow?.category_id || 
+                          originalRow?.transaction_category_id || 
+                          "uncategorized";
+        
+        // ✅ JOIN結果を優先してカテゴリ情報を取得
+        const categoryInfo = getCategoryInfo(categoryId, originalRow);
+        const amount =
+          typeof txn.amount === "number"
+            ? txn.amount
+            : parseFloat(String(txn.amount)) || 0;
+        
+        // ✅ カテゴリIDを正規化（文字列に統一）
+        const normalizedCategoryId = String(categoryId);
+        
+        const existing = expenseCategoryMap.get(normalizedCategoryId) || {
           amount: 0,
-          name: categoryName,
-          color: txn.category_color || "#9E9E9E",
-          icon: txn.category_icon || "tag",
+          name: categoryInfo.name,
+          color: categoryInfo.color,
+          icon: categoryInfo.icon,
+          categoryId: normalizedCategoryId,
         };
-        expenseCategoryMap.set(categoryId, {
+        expenseCategoryMap.set(normalizedCategoryId, {
           ...existing,
           amount: existing.amount + amount,
         });
@@ -408,19 +632,69 @@ const ChartScreen = () => {
       // Calculate income distribution
       const incomeCategoryMap = new Map<
         string,
-        { amount: number; name: string; color: string; icon: string }
+        { amount: number; name: string; color: string; icon: string; categoryId: string }
       >();
-      incomeTransactions.forEach((txn: any) => {
-        const categoryId = txn.category_id || "uncategorized";
-        const categoryName = txn.category_name || "Chưa phân loại";
-        const amount = parseFloat(txn.amount) || 0;
-        const existing = incomeCategoryMap.get(categoryId) || {
+      
+      // ✅ デバッグ: 収入取引のカテゴリIDを確認
+      const incomeCategoryIdsInTransactions = new Set<string>();
+      incomeTransactions.forEach((txn: Transaction) => {
+        const catId = txn.categoryId || (txn as any).category_id || null;
+        if (catId) {
+          incomeCategoryIdsInTransactions.add(String(catId));
+        }
+      });
+      console.log(`📊 Found ${incomeCategoryIdsInTransactions.size} unique category IDs in income transactions:`, Array.from(incomeCategoryIdsInTransactions).slice(0, 10));
+      
+      // ✅ 改善: 収入取引の元データ（row）も保持してJOIN結果を活用
+      const incomeTransactionsWithRows = incomeTransactions.map((txn) => {
+        const originalRow = allTransactionsRaw.find((row: any) => row.id === txn.id);
+        return { txn, row: originalRow };
+      });
+      
+      // カテゴリ情報を取得（同期処理）
+      incomeTransactionsWithRows.forEach(({ txn, row }) => {
+        // ✅ 複数のフィールド名からcategoryIdを取得
+        const categoryId = txn.categoryId || (txn as any).category_id || (txn as any).categoryID || row?.category_id || row?.transaction_category_id || "uncategorized";
+        
+        // ✅ JOIN結果から直接取得を試みる
+        let categoryInfo;
+        if (row && row.category_name) {
+          categoryInfo = {
+            name: row.category_name || "Không phân loại",
+            icon: row.category_icon || "tag",
+            color: row.category_color || "#4CAF50",
+          };
+        } else {
+          // メモリ内のカテゴリリストから検索
+          const category = categories.find(
+            (cat) =>
+              cat.id === categoryId ||
+              cat.id === String(categoryId) ||
+              String(cat.id) === String(categoryId)
+          );
+          categoryInfo = {
+            name: category?.name || "Không phân loại",
+            icon: category?.icon || "tag",
+            color: category?.color || "#4CAF50",
+          };
+        }
+        
+        const amount =
+          typeof txn.amount === "number"
+            ? txn.amount
+            : parseFloat(String(txn.amount)) || 0;
+        
+        // ✅ カテゴリIDを正規化（文字列に統一）
+        const normalizedCategoryId = String(categoryId);
+        
+        const existing = incomeCategoryMap.get(normalizedCategoryId) || {
           amount: 0,
-          name: categoryName,
-          color: txn.category_color || "#4CAF50",
-          icon: txn.category_icon || "tag",
+          name: categoryInfo.name,
+          color: categoryInfo.color || "#4CAF50",
+          icon: categoryInfo.icon,
+          categoryId: normalizedCategoryId,
         };
-        incomeCategoryMap.set(categoryId, {
+        incomeCategoryMap.set(normalizedCategoryId, {
           ...existing,
           amount: existing.amount + amount,
         });
@@ -472,25 +746,33 @@ const ChartScreen = () => {
           59
         ).toISOString();
 
-        const monthTransactions = await retryDbOperation(async () => {
+        const monthTransactionsRaw = await retryDbOperation(async () => {
           return await databaseService.getTransactionsByUser(user.uid, {
             startDate: monthStart,
             endDate: monthEnd,
           });
         });
 
+        // Map to Transaction objects
+        const monthTransactions: Transaction[] = Array.isArray(
+          monthTransactionsRaw
+        )
+          ? monthTransactionsRaw.map((row: any) => mapRowToTransaction(row))
+          : [];
+
         let monthIncome = 0;
         let monthExpense = 0;
-        if (Array.isArray(monthTransactions)) {
-          monthTransactions.forEach((txn: any) => {
-            const amount = parseFloat(txn.amount) || 0;
-            if (txn.type === "INCOME") {
-              monthIncome += amount;
-            } else if (txn.type === "EXPENSE") {
-              monthExpense += amount;
-            }
-          });
-        }
+        monthTransactions.forEach((txn: Transaction) => {
+          const amount =
+            typeof txn.amount === "number"
+              ? txn.amount
+              : parseFloat(String(txn.amount)) || 0;
+          if (txn.type === "INCOME") {
+            monthIncome += amount;
+          } else if (txn.type === "EXPENSE") {
+            monthExpense += amount;
+          }
+        });
 
         monthlyData.push({
           period: `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(
@@ -533,25 +815,31 @@ const ChartScreen = () => {
           59
         ).toISOString();
 
-        const dayTransactions = await retryDbOperation(async () => {
+        const dayTransactionsRaw = await retryDbOperation(async () => {
           return await databaseService.getTransactionsByUser(user.uid, {
             startDate: dayStart,
             endDate: dayEnd,
           });
         });
 
+        // Map to Transaction objects
+        const dayTransactions: Transaction[] = Array.isArray(dayTransactionsRaw)
+          ? dayTransactionsRaw.map((row: any) => mapRowToTransaction(row))
+          : [];
+
         let dayIncome = 0;
         let dayExpense = 0;
-        if (Array.isArray(dayTransactions)) {
-          dayTransactions.forEach((txn: any) => {
-            const amount = parseFloat(txn.amount) || 0;
-            if (txn.type === "INCOME") {
-              dayIncome += amount;
-            } else if (txn.type === "EXPENSE") {
-              dayExpense += amount;
-            }
-          });
-        }
+        dayTransactions.forEach((txn: Transaction) => {
+          const amount =
+            typeof txn.amount === "number"
+              ? txn.amount
+              : parseFloat(String(txn.amount)) || 0;
+          if (txn.type === "INCOME") {
+            dayIncome += amount;
+          } else if (txn.type === "EXPENSE") {
+            dayExpense += amount;
+          }
+        });
 
         trendData.push({
           date: dayStart,
@@ -975,7 +1263,9 @@ const ChartScreen = () => {
                 errorMessage.includes("finalizeAsync")) &&
               i < maxRetries - 1
             ) {
-              await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+              await new Promise((resolve) =>
+                setTimeout(resolve, delay * (i + 1))
+              );
               continue;
             }
             throw error;
@@ -1097,7 +1387,9 @@ const ChartScreen = () => {
                 errorMessage.includes("finalizeAsync")) &&
               i < maxRetries - 1
             ) {
-              await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+              await new Promise((resolve) =>
+                setTimeout(resolve, delay * (i + 1))
+              );
               continue;
             }
             throw error;
@@ -1123,11 +1415,16 @@ const ChartScreen = () => {
                 errorMessage.includes("UNIQUE constraint")) &&
               i < maxRetries - 1
             ) {
-              await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+              await new Promise((resolve) =>
+                setTimeout(resolve, delay * (i + 1))
+              );
               continue;
             }
             // Suppress UNIQUE constraint errors during retries
-            if (errorMessage.includes("UNIQUE constraint") && i < maxRetries - 1) {
+            if (
+              errorMessage.includes("UNIQUE constraint") &&
+              i < maxRetries - 1
+            ) {
               continue;
             }
             throw error;
@@ -1200,7 +1497,9 @@ const ChartScreen = () => {
               // Sync Firebase transactions to SQLite with queue and retry
               // Prevent concurrent sync operations
               if (isSyncingTransactions) {
-                console.log("⏳ Transaction sync already in progress, skipping...");
+                console.log(
+                  "⏳ Transaction sync already in progress, skipping..."
+                );
                 return;
               }
 
@@ -1216,6 +1515,17 @@ const ChartScreen = () => {
                   const transactionsToSync = [];
                   for (const doc of snapshot.docs) {
                     const data = doc.data();
+                    const now = new Date().toISOString();
+                    const createdAt = data.createdAt?.toMillis
+                      ? new Date(data.createdAt.toMillis()).toISOString()
+                      : data.createdAt || now;
+                    const updatedAt = data.updatedAt?.toMillis
+                      ? new Date(data.updatedAt.toMillis()).toISOString()
+                      : data.updatedAt || data.lastModifiedAt?.toMillis
+                      ? new Date(data.lastModifiedAt.toMillis()).toISOString()
+                      : data.lastModifiedAt || now;
+                    const lastModifiedAt = updatedAt;
+
                     transactionsToSync.push({
                       id: doc.id,
                       data: {
@@ -1226,7 +1536,7 @@ const ChartScreen = () => {
                         type: data.type || "EXPENSE",
                         date: data.date?.toMillis
                           ? new Date(data.date.toMillis()).toISOString()
-                          : data.date || new Date().toISOString(),
+                          : data.date || now,
                         description: data.description || null,
                         paymentMethod: data.paymentMethod || null,
                         merchantName: data.merchantName || null,
@@ -1235,13 +1545,9 @@ const ChartScreen = () => {
                         longitude: data.longitude || null,
                         tags: data.tags ? data.tags.split(",") : undefined,
                         isSynced: true,
-                        lastModifiedAt: data.updatedAt?.toMillis
-                          ? new Date(data.updatedAt.toMillis()).toISOString()
-                          : new Date().toISOString(),
+                        lastModifiedAt: lastModifiedAt, // ✅ Đảm bảo có lastModifiedAt
                         isDeleted: false,
-                        createdAt: data.createdAt?.toMillis
-                          ? new Date(data.createdAt.toMillis()).toISOString()
-                          : new Date().toISOString(),
+                        createdAt: createdAt,
                       },
                     });
                   }
@@ -1251,16 +1557,22 @@ const ChartScreen = () => {
                   for (const { id, data: txnData } of transactionsToSync) {
                     try {
                       await retryDbOperation(async () => {
-                        const existing = await TransactionRepository.getById(id);
+                        const existing = await TransactionRepository.getById(
+                          id
+                        );
                         if (!existing) {
                           await TransactionRepository.create(txnData);
                           syncedCount++;
                         }
                       });
                     } catch (syncError: any) {
-                      const errorMessage = syncError?.message || String(syncError);
+                      const errorMessage =
+                        syncError?.message || String(syncError);
                       if (!errorMessage.includes("database is locked")) {
-                        console.warn(`Failed to sync transaction ${id}:`, syncError);
+                        console.warn(
+                          `Failed to sync transaction ${id}:`,
+                          syncError
+                        );
                       }
                     }
                     // Small delay between operations to prevent lock
@@ -1268,7 +1580,9 @@ const ChartScreen = () => {
                   }
 
                   if (syncedCount > 0) {
-                    console.log(`✅ Synced ${syncedCount} transactions to SQLite`);
+                    console.log(
+                      `✅ Synced ${syncedCount} transactions to SQLite`
+                    );
                   }
 
                   // Reload data after syncing transactions (debounced)
@@ -1336,7 +1650,9 @@ const ChartScreen = () => {
               // Sync Firebase categories to SQLite with queue and retry
               // Prevent concurrent sync operations
               if (isSyncingCategories) {
-                console.log("⏳ Category sync already in progress, skipping...");
+                console.log(
+                  "⏳ Category sync already in progress, skipping..."
+                );
                 return;
               }
 
@@ -1354,7 +1670,7 @@ const ChartScreen = () => {
                   const CategoryRepository = (
                     await import("./database/repositories")
                   ).CategoryRepository;
-                  
+
                   // Load categories with retry
                   let currentSQLiteCategories = await retryCategoryOperation(
                     async () => await CategoryRepository.listByUser(user.uid)
@@ -1364,20 +1680,27 @@ const ChartScreen = () => {
                   try {
                     const removedCount = await retryCategoryOperation(
                       async () =>
-                        await databaseService.removeDuplicateCategories(user.uid)
+                        await databaseService.removeDuplicateCategories(
+                          user.uid
+                        )
                     );
                     if (removedCount > 0) {
                       console.log(
                         `🧹 Removed ${removedCount} duplicate categories`
                       );
                       currentSQLiteCategories = await retryCategoryOperation(
-                        async () => await CategoryRepository.listByUser(user.uid)
+                        async () =>
+                          await CategoryRepository.listByUser(user.uid)
                       );
                     }
                   } catch (cleanupError: any) {
-                    const errorMessage = cleanupError?.message || String(cleanupError);
+                    const errorMessage =
+                      cleanupError?.message || String(cleanupError);
                     if (!errorMessage.includes("database is locked")) {
-                      console.warn("Failed to remove duplicates:", cleanupError);
+                      console.warn(
+                        "Failed to remove duplicates:",
+                        cleanupError
+                      );
                     }
                   }
 
@@ -1440,19 +1763,27 @@ const ChartScreen = () => {
                             color: data.color || "#2196F3",
                           } as any);
                         } catch (createError: any) {
-                          const errorMessage = createError?.message || String(createError);
+                          const errorMessage =
+                            createError?.message || String(createError);
                           if (
                             !errorMessage.includes("UNIQUE constraint") &&
                             !errorMessage.includes("database is locked")
                           ) {
-                            console.warn(`Failed to create category ${doc.id}:`, createError);
+                            console.warn(
+                              `Failed to create category ${doc.id}:`,
+                              createError
+                            );
                           }
                         }
                       }
                     } catch (syncError: any) {
-                      const errorMessage = syncError?.message || String(syncError);
+                      const errorMessage =
+                        syncError?.message || String(syncError);
                       if (!errorMessage.includes("database is locked")) {
-                        console.warn(`Failed to sync category ${doc.id}:`, syncError);
+                        console.warn(
+                          `Failed to sync category ${doc.id}:`,
+                          syncError
+                        );
                       }
                     }
                     // Small delay between operations to prevent lock
@@ -1463,10 +1794,13 @@ const ChartScreen = () => {
                   try {
                     await retryCategoryOperation(
                       async () =>
-                        await databaseService.removeDuplicateCategories(user.uid)
+                        await databaseService.removeDuplicateCategories(
+                          user.uid
+                        )
                     );
                   } catch (cleanupError: any) {
-                    const errorMessage = cleanupError?.message || String(cleanupError);
+                    const errorMessage =
+                      cleanupError?.message || String(cleanupError);
                     if (!errorMessage.includes("database is locked")) {
                       console.warn(
                         "Failed to remove duplicates after sync:",
@@ -1484,7 +1818,10 @@ const ChartScreen = () => {
                 } catch (syncError: any) {
                   const errorMessage = syncError?.message || String(syncError);
                   if (!errorMessage.includes("database is locked")) {
-                    console.warn("Failed to sync categories to SQLite:", syncError);
+                    console.warn(
+                      "Failed to sync categories to SQLite:",
+                      syncError
+                    );
                   }
                 } finally {
                   isSyncingCategories = false;
@@ -1732,69 +2069,13 @@ const ChartScreen = () => {
         </View>
       </View>
 
-      {/* Summary Cards */}
-      <View style={styles.summarySection}>
-        <View style={styles.summaryCard}>
-          <View style={styles.summaryIconWrapper}>
-            <Icon name="arrow-up" size={24} color="#F44336" />
-          </View>
-          <View style={styles.summaryInfo}>
-            <Text style={styles.summaryLabel}>Tổng chi tiêu</Text>
-            <Text style={styles.summaryAmount}>
-              {formatCurrency(totalExpense)}
-            </Text>
-          </View>
-        </View>
-
-        <View style={styles.summaryCard}>
-          <View
-            style={[
-              styles.summaryIconWrapper,
-              { backgroundColor: "rgba(76, 175, 80, 0.15)" },
-            ]}
-          >
-            <Icon name="arrow-down" size={24} color="#4CAF50" />
-          </View>
-          <View style={styles.summaryInfo}>
-            <Text style={styles.summaryLabel}>Tổng thu nhập</Text>
-            <Text style={styles.summaryAmount}>
-              {formatCurrency(totalIncome)}
-            </Text>
-          </View>
-        </View>
-
-        <View style={[styles.summaryCard, styles.summaryCardWide]}>
-          <View
-            style={[
-              styles.summaryIconWrapper,
-              {
-                backgroundColor:
-                  balance >= 0
-                    ? "rgba(33, 150, 243, 0.15)"
-                    : "rgba(244, 67, 54, 0.15)",
-              },
-            ]}
-          >
-            <Icon
-              name="wallet"
-              size={24}
-              color={balance >= 0 ? "#1E88E5" : "#F44336"}
-            />
-          </View>
-          <View style={styles.summaryInfo}>
-            <Text style={styles.summaryLabel}>Số dư</Text>
-            <Text
-              style={[
-                styles.summaryAmount,
-                { color: balance >= 0 ? "#1E88E5" : "#F44336" },
-              ]}
-            >
-              {balance >= 0 ? "+" : ""}
-              {formatCurrency(Math.abs(balance))}
-            </Text>
-          </View>
-        </View>
-      </View>
+      {/* Summary Header - Compact */}
+      <SummaryHeader
+        totalIncome={totalIncome}
+        totalExpense={totalExpense}
+        balance={balance}
+        formatCurrency={formatCurrency}
+      />
 
       {/* Period Filter & Actions */}
       <View style={styles.periodSection}>
@@ -2018,140 +2299,30 @@ const ChartScreen = () => {
         </TouchableOpacity>
       </View>
 
-      {/* Content */}
-      <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
+      {/* Content - Render screens based on active tab */}
+      <View style={styles.content}>
         {activeTab === "chart" && (
-          <>
-            {/* Pie Charts */}
-            <PieChart
-              data={pieChartExpenseData}
-              title="Phân loại Chi tiêu"
-              total={totalExpense}
-            />
-            <PieChart
-              data={pieChartIncomeData}
-              title="Phân loại Thu nhập"
-              total={totalIncome}
-            />
-
-            {/* Bar Chart - Monthly Comparison */}
-            <BarChart
-              data={barChartData}
-              title="So sánh Thu nhập & Chi tiêu theo Tháng"
-              yAxisLabel=""
-              yAxisSuffix="K ₫"
-              themeColor={themeColor}
-            />
-
-            {/* Line Chart - Trend */}
-            <LineChart
-              data={lineChartData}
-              title="Xu hướng Thu nhập & Chi tiêu"
-              yAxisLabel=""
-              yAxisSuffix="K ₫"
-              themeColor={themeColor}
-            />
-          </>
+          <ChartsScreen
+            pieChartExpenseData={pieChartExpenseData}
+            pieChartIncomeData={pieChartIncomeData}
+            barChartData={barChartData}
+            lineChartData={lineChartData}
+            totalIncome={totalIncome}
+            totalExpense={totalExpense}
+            themeColor={themeColor}
+          />
         )}
 
         {activeTab === "stats" && (
-          <>
-            {/* Category Statistics */}
-            <View style={styles.statsContainer}>
-              <Text style={styles.statsTitle}>
-                Thống kê Chi tiêu theo Danh mục
-              </Text>
-              {expenseCategories.length > 0 ? (
-                expenseCategories.map((cat, index) => (
-                  <View key={index} style={styles.statItem}>
-                    <View style={styles.statItemLeft}>
-                      <View
-                        style={[
-                          styles.statIcon,
-                          { backgroundColor: cat.color || "#FF6B6B" },
-                        ]}
-                      >
-                        <Icon name={cat.icon || "tag"} size={20} color="#fff" />
-                      </View>
-                      <View style={styles.statInfo}>
-                        <Text style={styles.statName}>{cat.categoryName}</Text>
-                        <Text style={styles.statPercentage}>
-                          {cat.percentage.toFixed(1)}% tổng chi tiêu
-                        </Text>
-                      </View>
-                    </View>
-                    <Text style={styles.statAmount}>
-                      {formatCurrency(cat.amount)}
-                    </Text>
-                  </View>
-                ))
-              ) : (
-                <View style={styles.emptyState}>
-                  <Icon name="chart-bar" size={48} color="#E0E0E0" />
-                  <Text style={styles.emptyStateText}>Chưa có dữ liệu</Text>
-                </View>
-              )}
-            </View>
-
-            {/* Monthly Summary */}
-            <View style={styles.statsContainer}>
-              <Text style={styles.statsTitle}>Tóm tắt theo Tháng</Text>
-              {monthlyComparison.length > 0 ? (
-                monthlyComparison.map((month, index) => (
-                  <View key={index} style={styles.monthSummaryItem}>
-                    <Text style={styles.monthLabel}>{month.period}</Text>
-                    <View style={styles.monthDetails}>
-                      <View style={styles.monthDetailRow}>
-                        <Text style={styles.monthDetailLabel}>Thu nhập:</Text>
-                        <Text
-                          style={[
-                            styles.monthDetailValue,
-                            { color: "#4CAF50" },
-                          ]}
-                        >
-                          {formatCurrency(month.income)}
-                        </Text>
-                      </View>
-                      <View style={styles.monthDetailRow}>
-                        <Text style={styles.monthDetailLabel}>Chi tiêu:</Text>
-                        <Text
-                          style={[
-                            styles.monthDetailValue,
-                            { color: "#F44336" },
-                          ]}
-                        >
-                          {formatCurrency(month.expense)}
-                        </Text>
-                      </View>
-                      <View style={styles.monthDetailRow}>
-                        <Text style={styles.monthDetailLabel}>Số dư:</Text>
-                        <Text
-                          style={[
-                            styles.monthDetailValue,
-                            {
-                              color: month.balance >= 0 ? "#1E88E5" : "#F44336",
-                            },
-                          ]}
-                        >
-                          {month.balance >= 0 ? "+" : ""}
-                          {formatCurrency(Math.abs(month.balance))}
-                        </Text>
-                      </View>
-                    </View>
-                  </View>
-                ))
-              ) : (
-                <View style={styles.emptyState}>
-                  <Icon name="calendar" size={48} color="#E0E0E0" />
-                  <Text style={styles.emptyStateText}>Chưa có dữ liệu</Text>
-                </View>
-              )}
-            </View>
-          </>
+          <StatisticsScreen
+            expenseCategories={expenseCategories}
+            monthlyComparison={monthlyComparison}
+            formatCurrency={formatCurrency}
+          />
         )}
 
         {activeTab === "budget" && (
-          <BudgetAndGoalsOverview
+          <BudgetScreen
             monthlyIncome={monthlyIncome}
             lastMonthsExpenses={lastMonthsExpenses}
             categories={categories}
@@ -2170,9 +2341,7 @@ const ChartScreen = () => {
             formatCurrency={formatCurrency}
           />
         )}
-
-        <View style={{ height: 40 }} />
-      </ScrollView>
+      </View>
 
       {/* Category Filter Modal */}
       <Modal

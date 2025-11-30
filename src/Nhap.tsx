@@ -139,7 +139,11 @@ const NhapGiaoDich = () => {
   const handleCategorySyncFromFirebase = useCallback(
     async (currentUserId: string, isActiveFlag: boolean) => {
       // Retry helper function
-      const retryDbOperation = async (operation: () => Promise<any>, maxRetries = 3, delay = 100) => {
+      const retryDbOperation = async (
+        operation: () => Promise<any>,
+        maxRetries = 3,
+        delay = 100
+      ) => {
         for (let i = 0; i < maxRetries; i++) {
           try {
             return await operation();
@@ -150,7 +154,9 @@ const NhapGiaoDich = () => {
                 errorMessage.includes("finalizeAsync")) &&
               i < maxRetries - 1
             ) {
-              await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+              await new Promise((resolve) =>
+                setTimeout(resolve, delay * (i + 1))
+              );
               continue;
             }
             throw error;
@@ -382,7 +388,11 @@ const NhapGiaoDich = () => {
     }
 
     // Retry helper function
-    const retryDbOperation = async (operation: () => Promise<any>, maxRetries = 3, delay = 100) => {
+    const retryDbOperation = async (
+      operation: () => Promise<any>,
+      maxRetries = 3,
+      delay = 100
+    ) => {
       for (let i = 0; i < maxRetries; i++) {
         try {
           return await operation();
@@ -393,7 +403,9 @@ const NhapGiaoDich = () => {
               errorMessage.includes("finalizeAsync")) &&
             i < maxRetries - 1
           ) {
-            await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
+            await new Promise((resolve) =>
+              setTimeout(resolve, delay * (i + 1))
+            );
             continue;
           }
           throw error;
@@ -432,9 +444,13 @@ const NhapGiaoDich = () => {
 
       // Sync in background with retry
       try {
-        await retryDbOperation(async () => {
-          await SyncEngine.performSync(userId, true);
-        }, 2, 200); // 2 retries with 200ms delay for sync
+        await retryDbOperation(
+          async () => {
+            await SyncEngine.performSync(userId, true);
+          },
+          2,
+          200
+        ); // 2 retries with 200ms delay for sync
         console.log("✅ Transaction synced to Firebase");
       } catch (err: any) {
         const errorMessage = err?.message || String(err);
@@ -462,10 +478,7 @@ const NhapGiaoDich = () => {
       const errorMessage = error?.message || String(error);
       if (!errorMessage.includes("database is locked")) {
         console.error("Error saving transaction:", error);
-        Alert.alert(
-          "Lỗi",
-          "Không thể lưu giao dịch: " + errorMessage
-        );
+        Alert.alert("Lỗi", "Không thể lưu giao dịch: " + errorMessage);
       } else {
         // Retry once more for database lock errors
         try {
@@ -475,10 +488,7 @@ const NhapGiaoDich = () => {
           Alert.alert("Thành công", "Giao dịch đã được lưu");
         } catch (retryError) {
           console.error("Error saving transaction after retry:", retryError);
-          Alert.alert(
-            "Lỗi",
-            "Không thể lưu giao dịch. Vui lòng thử lại sau."
-          );
+          Alert.alert("Lỗi", "Không thể lưu giao dịch. Vui lòng thử lại sau.");
         }
       }
     } finally {

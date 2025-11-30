@@ -13,14 +13,13 @@ import {
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { Category } from "../../domain/types";
 import { auth } from "../../firebaseConfig";
-import {
-  BudgetRecommendation,
-  CategoryBudget,
-  SpendingTrendAnalysis,
-  BudgetAdjustmentSuggestions,
-  BudgetAlerts,
-  GoalTracker,
-} from "./index";
+// ✅ Fix require cycle: Import trực tiếp từ các file thay vì từ index.ts
+import { BudgetRecommendation } from "./BudgetRecommendation";
+import { CategoryBudget } from "./CategoryBudget";
+import { SpendingTrendAnalysis } from "./SpendingTrendAnalysis";
+import { BudgetAdjustmentSuggestions } from "./BudgetAdjustmentSuggestions";
+import { BudgetAlerts } from "./BudgetAlerts";
+import { GoalTracker } from "./GoalTracker";
 
 interface BudgetAndGoalsOverviewProps {
   monthlyIncome: number;

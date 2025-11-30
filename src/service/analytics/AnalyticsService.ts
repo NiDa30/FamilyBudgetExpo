@@ -82,14 +82,35 @@ export class AnalyticsService {
       });
 
       const categories = await CategoryRepository.listByUser(userId);
-      const categoryMap = new Map(
-        categories.map((c) => [c.id, { name: c.name, color: c.color, icon: c.icon }])
-      );
+      // ✅ 改善: 複数のキーでカテゴリマップを作成
+      const categoryMap = new Map<string, { name: string; color?: string; icon?: string }>();
+      categories.forEach((c) => {
+        categoryMap.set(c.id, { name: c.name, color: c.color, icon: c.icon });
+        // 追加のキーも登録（互換性のため）
+        if ((c as any).categoryID) {
+          categoryMap.set((c as any).categoryID, { name: c.name, color: c.color, icon: c.icon });
+        }
+        if ((c as any).category_id) {
+          categoryMap.set((c as any).category_id, { name: c.name, color: c.color, icon: c.icon });
+        }
+      });
+
+      // ✅ デバッグ: カテゴリと取引のカテゴリIDを確認
+      const transactionCategoryIds = new Set<string>();
+      transactions.forEach((t) => {
+        const catId = t.categoryId || (t as any).category_id || (t as any).categoryID;
+        if (catId) {
+          transactionCategoryIds.add(String(catId));
+        }
+      });
+      console.log(`📊 AnalyticsService: Found ${transactionCategoryIds.size} unique category IDs in transactions`);
+      console.log(`📊 AnalyticsService: Available categories: ${categories.length}`);
 
       // カテゴリ別に集計
       const categoryTotals = new Map<string, number>();
       transactions.forEach((t) => {
-        const categoryId = t.categoryId || "uncategorized";
+        // ✅ 複数のフィールド名からcategoryIdを取得
+        const categoryId = String(t.categoryId || (t as any).category_id || (t as any).categoryID || "uncategorized");
         const current = categoryTotals.get(categoryId) || 0;
         categoryTotals.set(categoryId, current + (t.amount || 0));
       });
@@ -234,54 +255,27 @@ export class AnalyticsService {
 
   /**
    * 予算超過アラートをチェック
+   * ✅ 改善: BudgetServiceを使用して正確な予算データを取得
    */
   static async checkBudgetAlerts(
     userId: UUID,
     monthYear: string
   ): Promise<BudgetAlert[]> {
     try {
-      // TODO: BudgetRepositoryから予算を取得
-      // 現在はカテゴリ別の支出をチェック
-      const [start, end] = monthYear.split("-");
-      const startDate = new Date(parseInt(start), parseInt(end) - 1, 1);
-      const endDate = new Date(parseInt(start), parseInt(end), 0, 23, 59, 59);
+      // BudgetServiceを使用して予算警告を取得
+      const BudgetService = (await import("../budget/BudgetService")).default;
+      const budgetAlerts = await BudgetService.checkBudgetAlerts(monthYear);
 
-      const range: DateRange = {
-        start: startDate.toISOString(),
-        end: endDate.toISOString(),
-      };
-
-      const categoryDistribution = await this.getCategoryDistribution(
-        userId,
-        range,
-        "EXPENSE"
-      );
-
-      // 仮の予算制限（実際にはBudgetRepositoryから取得）
-      const alerts: BudgetAlert[] = categoryDistribution
-        .filter((cat) => cat.amount > 0)
-        .map((cat) => {
-          // 仮の予算制限を計算（実際の実装ではBudgetRepositoryから取得）
-          const estimatedBudget = cat.amount * 1.2; // 20%余裕を持たせる
-          const percentage = (cat.amount / estimatedBudget) * 100;
-          const isOverLimit = percentage >= 100;
-          const alertLevel =
-            percentage >= 100 ? "critical" : percentage >= 90 ? "warning" : "warning";
-
-          return {
-            categoryId: cat.categoryId,
-            categoryName: cat.categoryName,
-            budgetLimit: estimatedBudget,
-            currentSpent: cat.amount,
-            percentage,
-            isOverLimit,
-            alertLevel,
-          };
-        })
-        .filter((alert) => alert.percentage >= 80) // 80%以上の場合のみアラート
-        .sort((a, b) => b.percentage - a.percentage);
-
-      return alerts;
+      // BudgetAlert形式に変換
+      return budgetAlerts.map((alert) => ({
+        categoryId: alert.categoryId,
+        categoryName: alert.categoryName,
+        budgetLimit: alert.budgetAmount,
+        currentSpent: alert.spentAmount,
+        percentage: alert.percentage,
+        isOverLimit: alert.percentage >= 100,
+        alertLevel: alert.alertLevel,
+      }));
     } catch (error) {
       console.error("Error checking budget alerts:", error);
       return [];

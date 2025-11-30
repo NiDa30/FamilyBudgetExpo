@@ -85,6 +85,8 @@ const LoginScreen: React.FC<Props> = ({ navigation }) => {
   };
 
   // Store user session in AsyncStorage for persistent login
+  // ✅ Firebase Authは既にAsyncStorageを使用するように設定されているため、
+  // この関数は主に追加情報を保存するために使用されます
   const storeUserSession = async (user: any) => {
     try {
       const userData = {
@@ -92,9 +94,9 @@ const LoginScreen: React.FC<Props> = ({ navigation }) => {
         email: user.email,
         displayName: user.displayName,
         photoURL: user.photoURL,
-        refreshToken: user.refreshToken,
+        lastLoginTime: new Date().toISOString(),
       };
-      await AsyncStorage.setItem("userSession", JSON.stringify(userData));
+      await AsyncStorage.setItem("@user_session", JSON.stringify(userData));
       console.log("✅ User session stored successfully");
     } catch (error) {
       console.error("❌ Error storing user session:", error);
@@ -104,7 +106,7 @@ const LoginScreen: React.FC<Props> = ({ navigation }) => {
   // Clear user session from AsyncStorage
   const clearUserSession = async () => {
     try {
-      await AsyncStorage.removeItem("userSession");
+      await AsyncStorage.removeItem("@user_session");
       console.log("✅ User session cleared successfully");
     } catch (error) {
       console.error("❌ Error clearing user session:", error);

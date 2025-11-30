@@ -19,7 +19,7 @@ export const COLLECTIONS = {
 
   // System
   SYNC_LOG: "SYNC_LOG",
-  LOGIN_HISTORY: "LOGIN_HISTORY", // Login history collection
+  ACTIVITY_LOG: "ACTIVITY_LOG", // Activity log collection
   NOTIFICATION: "NOTIFICATION",
   DEVICE: "DEVICE",
 
@@ -27,8 +27,8 @@ export const COLLECTIONS = {
   ATTACHMENT: "ATTACHMENT",
 
   // Payment & Merchants (Note: Firestore has typos)
-  PAYMENT_METHHOD: "PAYMENT_METHHOD", // Typo in Firestore
-  MERCHART: "MERCHART", // Typo in Firestore
+  PAYMENT_METHHOD: "PAYMENT_METHHOD", // Typo in Firestore - PAYMENT_METHHOD
+  MERCHART: "MERCHART", // Typo in Firestore - MERCHART
 
   // Tags & Organization
   TAG: "TAG",
@@ -41,7 +41,7 @@ export const COLLECTIONS = {
   CATEGORY_BUDGET_TEMPLATE: "CATEGORY_BUDGET_TEMPLATE",
 
   // Additional
-  expenses: "expenses", // If this collection exists
+  expenses: "expenses", // Lowercase collection name
 };
 
 // Freeze object to prevent modification

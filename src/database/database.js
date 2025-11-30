@@ -35,7 +35,7 @@ db.execSync(`
     updatedAt TEXT
   );
 
-  -- CATEGORY table (Firestore: CATEGORY)
+  -- CATEGORY table (Firestore: CATEGORIES - User categories)
   CREATE TABLE IF NOT EXISTS CATEGORY (
     categoryID TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -49,6 +49,23 @@ db.execSync(`
     isHidden BOOLEAN DEFAULT FALSE,
     createdAt TEXT,
     FOREIGN KEY (parentCategoryID) REFERENCES CATEGORY(categoryID) ON DELETE SET NULL
+  );
+
+  -- CATEGORY_DEFAULT table (Firestore: CATEGORIES_DEFAULT - System default categories)
+  CREATE TABLE IF NOT EXISTS CATEGORY_DEFAULT (
+    categoryID TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    type TEXT CHECK(type IN ('INCOME', 'EXPENSE')),
+    isSystemDefault BOOLEAN DEFAULT TRUE,
+    keywords TEXT,
+    icon TEXT,
+    color TEXT,
+    parentCategoryID TEXT,
+    displayOrder INTEGER DEFAULT 0,
+    isHidden BOOLEAN DEFAULT FALSE,
+    createdAt TEXT,
+    updatedAt TEXT,
+    FOREIGN KEY (parentCategoryID) REFERENCES CATEGORY_DEFAULT(categoryID) ON DELETE SET NULL
   );
 
   -- TRANSACTION table (Firestore: TRANSACTION)
@@ -184,6 +201,21 @@ db.execSync(`
     action TEXT,
     createdAt TEXT,
     FOREIGN KEY (userID) REFERENCES USER(userID) ON DELETE CASCADE
+  );
+
+  -- ACTIVITY_LOG table (Firestore: ACTIVITY_LOG)
+  CREATE TABLE IF NOT EXISTS ACTIVITY_LOG (
+    logID TEXT PRIMARY KEY,
+    userID TEXT NOT NULL,
+    action TEXT NOT NULL,
+    details TEXT,
+    targetUserID TEXT,
+    timestamp TEXT,
+    ipAddress TEXT,
+    userAgent TEXT,
+    createdAt TEXT,
+    FOREIGN KEY (userID) REFERENCES USER(userID) ON DELETE CASCADE,
+    FOREIGN KEY (targetUserID) REFERENCES USER(userID) ON DELETE SET NULL
   );
 
   -- NOTIFICATION table (Firestore: NOTIFICATION)
@@ -433,6 +465,37 @@ db.execSync(`
     FOREIGN KEY (userID) REFERENCES USER(userID) ON DELETE CASCADE
   );
 
+  -- EXPENSES table (Firestore: expenses - lowercase collection name)
+  CREATE TABLE IF NOT EXISTS EXPENSES (
+    expenseID TEXT PRIMARY KEY,
+    userID TEXT NOT NULL,
+    categoryID TEXT,
+    amount REAL NOT NULL,
+    type TEXT CHECK(type IN ('INCOME', 'EXPENSE')),
+    date TEXT NOT NULL,
+    description TEXT,
+    paymentMethod TEXT,
+    merchantName TEXT,
+    merchantLocation TEXT,
+    latitude REAL,
+    longitude REAL,
+    tags TEXT,
+    isSynced BOOLEAN DEFAULT FALSE,
+    lastModifiedAt TEXT,
+    location TEXT,
+    isDeleted BOOLEAN DEFAULT FALSE,
+    deletedAt TEXT,
+    createdBy TEXT,
+    hasAttachment BOOLEAN DEFAULT FALSE,
+    recurTxnID TEXT,
+    parentTransactionID TEXT,
+    createdAt TEXT,
+    updatedAt TEXT,
+    FOREIGN KEY (userID) REFERENCES USER(userID) ON DELETE CASCADE,
+    FOREIGN KEY (categoryID) REFERENCES CATEGORY(categoryID) ON DELETE SET NULL,
+    FOREIGN KEY (parentTransactionID) REFERENCES EXPENSES(expenseID) ON DELETE SET NULL
+  );
+
   -- ============================================
   -- INDEXES FOR PERFORMANCE
   -- ============================================
@@ -448,6 +511,11 @@ db.execSync(`
   CREATE INDEX IF NOT EXISTS idx_attachment_transactionID ON ATTACHMENT(transactionID);
   CREATE INDEX IF NOT EXISTS idx_sync_log_userID ON SYNC_LOG(userID);
   CREATE INDEX IF NOT EXISTS idx_sync_log_status ON SYNC_LOG(status);
+  CREATE INDEX IF NOT EXISTS idx_activity_log_userID ON ACTIVITY_LOG(userID);
+  CREATE INDEX IF NOT EXISTS idx_activity_log_action ON ACTIVITY_LOG(action);
+  CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON ACTIVITY_LOG(timestamp);
+  CREATE INDEX IF NOT EXISTS idx_category_default_type ON CATEGORY_DEFAULT(type);
+  CREATE INDEX IF NOT EXISTS idx_category_default_isHidden ON CATEGORY_DEFAULT(isHidden);
   CREATE INDEX IF NOT EXISTS idx_recurring_txn_userID ON RECURRING_TXN(userID);
   CREATE INDEX IF NOT EXISTS idx_recurring_txn_nextDueDate ON RECURRING_TXN(nextDueDate);
   CREATE INDEX IF NOT EXISTS idx_notification_userID ON NOTIFICATION(userID);
@@ -459,6 +527,10 @@ db.execSync(`
   CREATE INDEX IF NOT EXISTS idx_report_userID ON REPORT(userID);
   CREATE INDEX IF NOT EXISTS idx_goal_contribution_goalID ON GOAL_CONTRIBUTION(goalID);
   CREATE INDEX IF NOT EXISTS idx_budget_history_budgetID ON BUDGET_HISTORY(budgetID);
+  CREATE INDEX IF NOT EXISTS idx_expenses_userID ON EXPENSES(userID);
+  CREATE INDEX IF NOT EXISTS idx_expenses_date ON EXPENSES(date);
+  CREATE INDEX IF NOT EXISTS idx_expenses_categoryID ON EXPENSES(categoryID);
+  CREATE INDEX IF NOT EXISTS idx_expenses_isSynced ON EXPENSES(isSynced);
 `);
 
 // Database service functions

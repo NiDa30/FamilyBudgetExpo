@@ -261,19 +261,47 @@ class FirebaseService {
 
   async addGoal(userId, goal) {
     const docRef = await addDoc(collection(db, COLLECTIONS.GOAL), {
-      goalID: goal.id,
+      goalID: goal.id || `goal_${Date.now()}`,
       userID: userId,
       name: goal.name,
-      targetAmount: goal.target_amount,
-      savedAmount: goal.current_amount || 0,
-      startDate: Timestamp.fromMillis(goal.start_date),
-      endDate: Timestamp.fromMillis(goal.target_date),
-      monthlyContribution: goal.monthly_contribution || 0,
-      status: "ACTIVE",
+      targetAmount: goal.targetAmount || goal.target_amount || 0,
+      savedAmount: goal.savedAmount || goal.current_amount || 0,
+      startDate: goal.startDate ? Timestamp.fromDate(new Date(goal.startDate)) : Timestamp.now(),
+      endDate: goal.endDate ? Timestamp.fromDate(new Date(goal.endDate)) : Timestamp.now(),
+      monthlyContribution: goal.monthlyContribution || goal.monthly_contribution || 0,
+      status: goal.status || "ACTIVE",
       createdAt: Timestamp.now(),
       updatedAt: Timestamp.now(),
     });
     return docRef.id;
+  }
+
+  async updateGoal(goalId, updates) {
+    try {
+      // Find goal by goalID field
+      const q = query(collection(db, COLLECTIONS.GOAL), where("goalID", "==", goalId));
+      const snapshot = await getDocs(q);
+      
+      if (snapshot.empty) {
+        throw new Error("Goal not found");
+      }
+
+      const docRef = doc(db, COLLECTIONS.GOAL, snapshot.docs[0].id);
+      const updateData = {
+        ...updates,
+        updatedAt: Timestamp.now(),
+      };
+
+      // Convert date strings to Timestamps if present
+      if (updates.endDate) {
+        updateData.endDate = Timestamp.fromDate(new Date(updates.endDate));
+      }
+
+      await updateDoc(docRef, updateData);
+    } catch (error) {
+      console.error("Error updating goal in Firebase:", error);
+      throw error;
+    }
   }
 
   // ==================== PAYMENT METHODS ====================

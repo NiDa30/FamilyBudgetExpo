@@ -74,6 +74,8 @@ const Timkiem = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hasInitialLoadRef = useRef(false);
+  const isSearchingRef = useRef(false);
 
   // Filter states
   const [showFilters, setShowFilters] = useState(false);
@@ -381,6 +383,13 @@ const Timkiem = () => {
     async (query: string) => {
       if (!userId) return;
 
+      // Prevent concurrent searches
+      if (isSearchingRef.current) {
+        console.log("Search already in progress, skipping...");
+        return;
+      }
+
+      isSearchingRef.current = true;
       setIsLoading(true);
       try {
         await databaseService.ensureInitialized();
@@ -405,11 +414,30 @@ const Timkiem = () => {
           options.categoryId = filters.categoryId;
         }
 
-        // Get all transactions from databaseService
-        let allTransactions = await databaseService.getTransactionsByUser(
-          userId,
-          options
-        );
+        // Get all transactions from databaseService with retry for database lock errors
+        let allTransactions: any[] = [];
+        let retryCount = 0;
+        const maxRetries = 3;
+        
+        while (retryCount < maxRetries) {
+          try {
+            allTransactions = await databaseService.getTransactionsByUser(
+              userId,
+              options
+            );
+            break; // Success, exit retry loop
+          } catch (error: any) {
+            const errorMessage = error?.message || String(error);
+            if (errorMessage.includes("database is locked") && retryCount < maxRetries - 1) {
+              retryCount++;
+              console.log(`Database locked, retrying... (${retryCount}/${maxRetries})`);
+              // Wait before retry (exponential backoff)
+              await new Promise(resolve => setTimeout(resolve, 100 * retryCount));
+              continue;
+            }
+            throw error; // Re-throw if not a lock error or max retries reached
+          }
+        }
 
         // Ensure allTransactions is an array
         if (!Array.isArray(allTransactions)) {
@@ -456,10 +484,25 @@ const Timkiem = () => {
           ? allTransactions.map((row: any) => mapRowToTransaction(row))
           : [];
 
+        // Remove duplicates by ID (more efficient using Map)
+        const seenIds = new Map<string, Transaction>();
+        for (const transaction of mappedResults) {
+          if (transaction.id && !seenIds.has(transaction.id)) {
+            seenIds.set(transaction.id, transaction);
+          }
+        }
+        const uniqueResults = Array.from(seenIds.values());
+        
+        if (mappedResults.length !== uniqueResults.length) {
+          console.log(
+            `Removed ${mappedResults.length - uniqueResults.length} duplicate transactions`
+          );
+        }
+
         // Sort results
         const sortBy = filters.sortBy || "date";
         const sortDir = filters.sortDir || "DESC";
-        mappedResults.sort((a, b) => {
+        uniqueResults.sort((a, b) => {
           let aVal: any;
           let bVal: any;
 
@@ -485,29 +528,46 @@ const Timkiem = () => {
           }
         });
 
-        setSearchResults(mappedResults);
-        setStatistics(calculateStatistics(mappedResults));
+        setSearchResults(uniqueResults);
+        setStatistics(calculateStatistics(uniqueResults));
 
         // Show notification if results found
-        if (mappedResults.length > 0) {
-          console.log(`Found ${mappedResults.length} transactions`);
+        if (uniqueResults.length > 0) {
+          console.log(`Found ${uniqueResults.length} unique transactions`);
         } else {
           console.log("No transactions found with current filters");
         }
       } catch (error) {
         console.error("Error searching transactions:", error);
-        Alert.alert("Lỗi", "Không thể thực hiện tìm kiếm. Vui lòng thử lại.");
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (!errorMessage.includes("database is locked")) {
+          Alert.alert("Lỗi", "Không thể thực hiện tìm kiếm. Vui lòng thử lại.");
+        }
         setSearchResults([]);
       } finally {
         setIsLoading(false);
+        isSearchingRef.current = false;
       }
     },
     [userId, filters, getDateRange]
   );
 
-  // Handle search when query or filters change with debounce
+  // Initial load: show all transactions when component mounts (only once)
   useEffect(() => {
-    if (!userId) return;
+    if (!userId || hasInitialLoadRef.current) return;
+
+    hasInitialLoadRef.current = true;
+    // Load all transactions on initial mount (only once)
+    const timer = setTimeout(() => {
+      performSearch("");
+    }, 500); // Small delay to ensure database is ready
+
+    return () => clearTimeout(timer);
+  }, [userId, performSearch]);
+
+  // Handle search when query or filters change with debounce (skip initial load)
+  useEffect(() => {
+    if (!userId || !hasInitialLoadRef.current) return;
 
     // Clear previous timeout
     if (searchTimeoutRef.current) {
@@ -525,18 +585,6 @@ const Timkiem = () => {
       }
     };
   }, [searchQuery, filters, userId, performSearch]);
-
-  // Initial load: show all transactions when component mounts
-  useEffect(() => {
-    if (userId && !isLoading) {
-      // Load all transactions on initial mount (only once)
-      const timer = setTimeout(() => {
-        performSearch("");
-      }, 500); // Small delay to ensure database is ready
-
-      return () => clearTimeout(timer);
-    }
-  }, [userId]); // Only depend on userId, not performSearch
 
   // Get category info for a transaction
   const getCategoryInfo = (categoryId: string | null | undefined) => {
@@ -727,11 +775,11 @@ const Timkiem = () => {
               />
             </View>
             <View style={styles.transactionInfo}>
-              <Text style={styles.transactionCategory}>
-                {item.description || "Không có ghi chú"}
-              </Text>
               <Text style={styles.transactionCategoryName}>
                 {categoryInfo.name}
+              </Text>
+              <Text style={styles.transactionCategory}>
+                {item.description || "Không có ghi chú"}
               </Text>
             </View>
           </View>
@@ -2155,13 +2203,13 @@ const styles = StyleSheet.create({
   transactionInfo: {
     flex: 1,
   },
-  transactionCategory: {
+  transactionCategoryName: {
     fontSize: 16,
     fontWeight: "500",
     color: "#000",
     marginBottom: 2,
   },
-  transactionCategoryName: {
+  transactionCategory: {
     fontSize: 12,
     color: "#999",
   },

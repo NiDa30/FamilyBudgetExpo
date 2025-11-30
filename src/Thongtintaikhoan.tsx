@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
   TextInput,
 } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 import { useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
@@ -243,6 +244,9 @@ const Thongtintaikhoan = () => {
         style: "destructive",
         onPress: async () => {
           try {
+            // ✅ セッションをクリア
+            await AsyncStorage.removeItem("@user_session");
+            // Firebaseからサインアウト
             await signOut(auth);
             navigation.navigate("Login");
           } catch (error) {
